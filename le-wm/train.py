@@ -1,4 +1,5 @@
 import os
+import wandb
 from functools import partial
 from pathlib import Path
 
@@ -47,6 +48,10 @@ def lejepa_forward(self, batch, stage, cfg):
 
 @hydra.main(version_base=None, config_path="./config/train", config_name="lewm")
 def run(cfg):
+    wandb_key = os.environ.get("WANDB_API_KEY")
+    if wandb_key and cfg.wandb.enabled:
+        wandb.login(key=wandb_key)
+
     #########################
     ##       dataset       ##
     #########################
