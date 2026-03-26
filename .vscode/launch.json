@@ -1,0 +1,30 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Train LeWM (PushT)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/WorldModel4Driving/le-wm/train.py",
+            "cwd": "${workspaceFolder}/WorldModel4Driving/le-wm",
+            "python": "${workspaceFolder}/WorldModel4Driving/le-wm/.venv/bin/python",
+            "console": "integratedTerminal",
+            "args": ["data=pusht"],
+            "env": {
+                "STABLEWM_HOME": "/closed-loop-e2e/wm_data/dataset",
+                "WANDB_API_KEY": "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"
+            }
+        },
+        {
+            "name": "Python Debugger: Current File with Arguments",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "args": "${command:pickArgs}"
+        }
+    ]
+}
