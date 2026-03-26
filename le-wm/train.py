@@ -12,7 +12,7 @@ from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
 
 from jepa import JEPA
-from module import ARPredictor, Embedder, MLP, SIGReg
+from module import ARPredictor, Embedder, GaussianKLReg, MLP, SIGReg
 from utils import get_column_normalizer, get_img_preprocessor, ModelObjectCallBack
 
 
@@ -21,7 +21,7 @@ def lejepa_forward(self, batch, stage, cfg):
 
     ctx_len = cfg.wm.history_size
     n_preds = cfg.wm.num_preds
-    lambd = cfg.loss.sigreg.weight
+    lambd = cfg.loss.reg.weight
 
     # Replace NaN values with 0 (occurs at sequence boundaries)
     batch["action"] = torch.nan_to_num(batch["action"], 0.0)
@@ -39,8 +39,11 @@ def lejepa_forward(self, batch, stage, cfg):
 
     # LeWM loss
     output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
-    output["sigreg_loss"]= self.sigreg(emb.transpose(0, 1))
-    output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]  
+    if isinstance(self.reg, GaussianKLReg):
+        output["reg_loss"] = self.reg(output["mu"], output["log_var"])
+    else:
+        output["reg_loss"] = self.reg(emb.transpose(0, 1))
+    output["loss"] = output["pred_loss"] + lambd * output["reg_loss"]
 
     losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
     self.log_dict(losses_dict, on_step=True, sync_dist=True)
@@ -96,6 +99,10 @@ def run(cfg):
     embed_dim = cfg.wm.get("embed_dim", hidden_dim)
     effective_act_dim = cfg.data.dataset.frameskip * cfg.wm.action_dim
 
+    _reg_type = cfg.loss.reg.type
+    _reg_kwargs = dict(cfg.loss.reg.get("kwargs", {}))
+    _use_vae = (_reg_type == "gaussian_kl")
+
     predictor = ARPredictor(
         num_frames=cfg.wm.history_size,
         input_dim=embed_dim,
@@ -105,10 +112,10 @@ def run(cfg):
     )
 
     action_encoder = Embedder(input_dim=effective_act_dim, emb_dim=embed_dim)
-    
+
     projector = MLP(
         input_dim=hidden_dim,
-        output_dim=embed_dim,
+        output_dim=embed_dim * 2 if _use_vae else embed_dim,
         hidden_dim=2048,
         norm_fn=torch.nn.BatchNorm1d,
     )
@@ -126,6 +133,7 @@ def run(cfg):
         action_encoder=action_encoder,
         projector=projector,
         pred_proj=predictor_proj,
+        vae=_use_vae,
     )
 
     optimizers = {
@@ -138,9 +146,16 @@ def run(cfg):
     }
 
     data_module = spt.data.DataModule(train=train, val=val)
+    if _reg_type == "sigreg":
+        _reg = SIGReg(**_reg_kwargs)
+    elif _reg_type == "gaussian_kl":
+        _reg = GaussianKLReg()
+    else:
+        raise ValueError(f"Unknown loss.reg.type: {_reg_type!r}. Choose 'sigreg' or 'gaussian_kl'.")
+
     world_model = spt.Module(
         model = world_model,
-        sigreg = SIGReg(**cfg.loss.sigreg.kwargs),
+        reg = _reg,
         forward=partial(lejepa_forward, cfg=cfg),
         optim=optimizers,
     )

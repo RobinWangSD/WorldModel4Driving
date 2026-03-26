@@ -7,6 +7,20 @@ def modulate(x, shift, scale):
     """AdaLN-zero modulation"""
     return x * (1 + scale) + shift
 
+class GaussianKLReg(torch.nn.Module):
+    """KL divergence regularizer toward N(0, I).
+    KL(N(mu, sigma^2) || N(0, I)) = -0.5 * sum(1 + log_var - mu^2 - exp(log_var))
+    Requires the encoder to output mu and log_var (VAE-style reparameterization).
+    """
+
+    def forward(self, mu, log_var):
+        """
+        mu:      (B, T, D)
+        log_var: (B, T, D)
+        """
+        return -0.5 * (1 + log_var - mu.pow(2) - log_var.exp()).mean()
+
+
 class SIGReg(torch.nn.Module):
     """Sketch Isotropic Gaussian Regularizer (single-GPU!)"""
 

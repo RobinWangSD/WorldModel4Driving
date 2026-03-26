@@ -17,6 +17,7 @@ class JEPA(nn.Module):
         action_encoder,
         projector=None,
         pred_proj=None,
+        vae=False,
     ):
         super().__init__()
 
@@ -25,6 +26,7 @@ class JEPA(nn.Module):
         self.action_encoder = action_encoder
         self.projector = projector or nn.Identity()
         self.pred_proj = pred_proj or nn.Identity()
+        self.vae = vae
 
     def encode(self, info):
         """Encode observations and actions into embeddings.
@@ -36,7 +38,17 @@ class JEPA(nn.Module):
         pixels = rearrange(pixels, "b t ... -> (b t) ...") # flatten for encoding
         output = self.encoder(pixels, interpolate_pos_encoding=True)
         pixels_emb = output.last_hidden_state[:, 0]  # cls token
-        emb = self.projector(pixels_emb)
+        proj = self.projector(pixels_emb)
+        if self.vae:
+            mu, log_var = proj.chunk(2, dim=-1)
+            if self.training:
+                emb = mu + torch.randn_like(mu) * (0.5 * log_var).exp()
+            else:
+                emb = mu  # use mean at inference/rollout
+            info["mu"]      = rearrange(mu,      "(b t) d -> b t d", b=b)
+            info["log_var"] = rearrange(log_var, "(b t) d -> b t d", b=b)
+        else:
+            emb = proj
         info["emb"] = rearrange(emb, "(b t) d -> b t d", b=b)
 
         if "action" in info:
