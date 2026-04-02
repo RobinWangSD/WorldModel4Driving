@@ -5,6 +5,9 @@ import logging
 from torchvision import transforms
 from einops import rearrange, repeat
 
+from models.sigreg import SIGReg
+from models.conditional_vit import ConditionalViTPredictor
+
 log = logging.getLogger(__name__)
 
 class VWorldModel(nn.Module):
@@ -32,6 +35,10 @@ class VWorldModel(nn.Module):
         vcreg_std_coeff=0,
         vcreg_cov_coeff=0,
         vcreg_apply_to="enc",
+        sigreg=False,
+        sigreg_weight=0.09,
+        sigreg_knots=17,
+        sigreg_num_proj=1024,
         **kwargs,
     ):
         super().__init__()
@@ -57,6 +64,12 @@ class VWorldModel(nn.Module):
         self.vcreg = bool(vcreg)
         self.std_coeff = float(vcreg_std_coeff)
         self.cov_coeff = float(vcreg_cov_coeff)
+        self.use_sigreg = bool(sigreg)
+        self.sigreg_weight = float(sigreg_weight)
+        if self.use_sigreg:
+            self.sigreg = SIGReg(knots=sigreg_knots, num_proj=sigreg_num_proj)
+        self.use_conditional_predictor = isinstance(predictor, ConditionalViTPredictor)
+
         if vcreg_apply_to != "enc":
             raise ValueError(
                 f"Only encoder VCReg is supported, got vcreg_apply_to='{vcreg_apply_to}'."
@@ -96,6 +109,8 @@ class VWorldModel(nn.Module):
             self.std_coeff,
             self.cov_coeff,
         )
+        log.info("SIGReg enabled: %s, weight=%s", self.use_sigreg, self.sigreg_weight)
+        log.info("Conditional predictor (AdaLN-zero): %s", self.use_conditional_predictor)
 
         self.concat_dim = concat_dim # 0 or 1
         assert concat_dim == 0 or concat_dim == 1, f"concat_dim {concat_dim} not supported."
@@ -137,25 +152,43 @@ class VWorldModel(nn.Module):
         if self.decoder is not None:
             self.decoder.eval()
 
-    def encode(self, obs, act): 
+    def encode(self, obs, act):
         """
-        input :  obs (dict): "visual", "proprio", (b, num_frames, 3, img_size, img_size) 
+        input :  obs (dict): "visual", "proprio", (b, num_frames, 3, img_size, img_size)
         output:    z (tensor): (b, num_frames, num_patches, emb_dim)
+
+        When using conditional predictor, also stores self._act_emb for use in predict().
         """
         z_dct = self.encode_obs(obs)
         act_emb = self.encode_act(act)
-        if self.concat_dim == 0:
-            z = torch.cat(
-                    [z_dct['visual'], z_dct['proprio'].unsqueeze(2), act_emb.unsqueeze(2)], dim=2 # add as an extra token
-                )  # (b, num_frames, num_patches + 2, dim)
-        if self.concat_dim == 1:
-            proprio_tiled = repeat(z_dct['proprio'].unsqueeze(2), "b t 1 a -> b t f a", f=z_dct['visual'].shape[2])
-            proprio_repeated = proprio_tiled.repeat(1, 1, 1, self.num_proprio_repeat)
-            act_tiled = repeat(act_emb.unsqueeze(2), "b t 1 a -> b t f a", f=z_dct['visual'].shape[2])
-            act_repeated = act_tiled.repeat(1, 1, 1, self.num_action_repeat)
-            z = torch.cat(
-                [z_dct['visual'], proprio_repeated, act_repeated], dim=3
-            )  # (b, num_frames, num_patches, dim + action_dim)
+
+        if self.use_conditional_predictor:
+            # Store action embeddings separately for AdaLN-zero conditioning
+            self._act_emb = act_emb  # (b, num_frames, action_emb_dim)
+            # Only concat visual + proprio (no action tokens)
+            if self.concat_dim == 0:
+                z = torch.cat(
+                    [z_dct['visual'], z_dct['proprio'].unsqueeze(2)], dim=2
+                )  # (b, num_frames, num_patches + 1, dim)
+            elif self.concat_dim == 1:
+                proprio_tiled = repeat(z_dct['proprio'].unsqueeze(2), "b t 1 a -> b t f a", f=z_dct['visual'].shape[2])
+                proprio_repeated = proprio_tiled.repeat(1, 1, 1, self.num_proprio_repeat)
+                z = torch.cat(
+                    [z_dct['visual'], proprio_repeated], dim=3
+                )  # (b, num_frames, num_patches, dim + proprio_dim)
+        else:
+            if self.concat_dim == 0:
+                z = torch.cat(
+                        [z_dct['visual'], z_dct['proprio'].unsqueeze(2), act_emb.unsqueeze(2)], dim=2
+                    )  # (b, num_frames, num_patches + 2, dim)
+            if self.concat_dim == 1:
+                proprio_tiled = repeat(z_dct['proprio'].unsqueeze(2), "b t 1 a -> b t f a", f=z_dct['visual'].shape[2])
+                proprio_repeated = proprio_tiled.repeat(1, 1, 1, self.num_proprio_repeat)
+                act_tiled = repeat(act_emb.unsqueeze(2), "b t 1 a -> b t f a", f=z_dct['visual'].shape[2])
+                act_repeated = act_tiled.repeat(1, 1, 1, self.num_action_repeat)
+                z = torch.cat(
+                    [z_dct['visual'], proprio_repeated, act_repeated], dim=3
+                )  # (b, num_frames, num_patches, dim + action_dim)
         return z
     
     def encode_act(self, act):
@@ -182,16 +215,20 @@ class VWorldModel(nn.Module):
         proprio_emb = self.encode_proprio(proprio)
         return {"visual": visual_embs, "proprio": proprio_emb}
 
-    def predict(self, z):  # in embedding space
+    def predict(self, z, act_emb=None):  # in embedding space
         """
         input : z: (b, num_hist, num_patches, emb_dim)
+                act_emb: (b, num_hist, action_emb_dim) — only for conditional predictor
         output: z: (b, num_hist, num_patches, emb_dim)
         """
         T = z.shape[1]
-        # reshape to a batch of windows of inputs
         z = rearrange(z, "b t p d -> b (t p) d")
-        # (b, num_hist * num_patches per img, emb_dim)
-        z = self.predictor(z)
+        if self.use_conditional_predictor:
+            if act_emb is None:
+                act_emb = self._act_emb[:, :T]
+            z = self.predictor(z, act_emb)
+        else:
+            z = self.predictor(z)
         z = rearrange(z, "b (t p) d -> b t p d", t=T)
         return z
 
@@ -223,6 +260,18 @@ class VWorldModel(nn.Module):
         input: z (tensor)
         output: z_obs (dict), z_act (tensor)
         """
+        if self.use_conditional_predictor:
+            # No action tokens in z when using conditional predictor
+            if self.concat_dim == 0:
+                z_visual, z_proprio = z[:, :, :-1, :], z[:, :, -1, :]
+            elif self.concat_dim == 1:
+                z_visual = z[..., :-self.proprio_dim]
+                z_proprio = z[..., -self.proprio_dim:]
+                z_proprio = z_proprio[:, :, 0, : self.proprio_dim // self.num_proprio_repeat]
+            z_act = self._act_emb[:, :z.shape[1]] if hasattr(self, '_act_emb') else None
+            z_obs = {"visual": z_visual, "proprio": z_proprio}
+            return z_obs, z_act
+
         if self.concat_dim == 0:
             z_visual, z_proprio, z_act = z[:, :, :-2, :], z[:, :, -2, :], z[:, :, -1, :]
         elif self.concat_dim == 1:
@@ -236,12 +285,19 @@ class VWorldModel(nn.Module):
         return z_obs, z_act
 
     def visual_only(self, z):
+        if self.use_conditional_predictor:
+            if self.concat_dim == 0:
+                return z[:, :, :-1, :]  # drop proprio token only
+            drop = self.proprio_dim
+            return z[..., :-drop] if drop > 0 else z
         if self.concat_dim == 0:
             return z[:, :, :-2, :]
         drop = self.proprio_dim + self.action_dim
         return z[..., :-drop] if drop > 0 else z
 
     def visual_prop(self, z):
+        if self.use_conditional_predictor:
+            return z  # no action tokens to drop
         if self.concat_dim == 0:
             return z[:, :, :-1, :]
         return z[..., :-self.action_dim]
@@ -330,7 +386,21 @@ class VWorldModel(nn.Module):
 
             # Compute loss for visual, proprio dims (i.e. exclude action dims)
             z_tgt_for_loss = z_tgt.detach() if self.stop_grad else z_tgt
-            if self.concat_dim == 0:
+            if self.use_conditional_predictor:
+                # No action tokens in z — only visual + proprio
+                if self.concat_dim == 0:
+                    z_visual_loss = self.emb_criterion(z_pred[:, :, :-1, :], z_tgt_for_loss[:, :, :-1, :])
+                    z_proprio_loss = self.emb_criterion(z_pred[:, :, -1, :], z_tgt_for_loss[:, :, -1, :])
+                    z_loss = self.emb_criterion(z_pred, z_tgt_for_loss)
+                elif self.concat_dim == 1:
+                    z_visual_loss = self.emb_criterion(
+                        z_pred[..., :-self.proprio_dim], z_tgt_for_loss[..., :-self.proprio_dim]
+                    )
+                    z_proprio_loss = self.emb_criterion(
+                        z_pred[..., -self.proprio_dim:], z_tgt_for_loss[..., -self.proprio_dim:]
+                    )
+                    z_loss = self.emb_criterion(z_pred, z_tgt_for_loss)
+            elif self.concat_dim == 0:
                 z_visual_loss = self.emb_criterion(z_pred[:, :, :-2, :], z_tgt_for_loss[:, :, :-2, :])
                 z_proprio_loss = self.emb_criterion(z_pred[:, :, -2, :], z_tgt_for_loss[:, :, -2, :])
                 z_loss = self.emb_criterion(z_pred[:, :, :-1, :], z_tgt_for_loss[:, :, :-1, :])
@@ -340,11 +410,11 @@ class VWorldModel(nn.Module):
                     z_tgt_for_loss[:, :, :, :-(self.proprio_dim + self.action_dim)]
                 )
                 z_proprio_loss = self.emb_criterion(
-                    z_pred[:, :, :, -(self.proprio_dim + self.action_dim): -self.action_dim], 
+                    z_pred[:, :, :, -(self.proprio_dim + self.action_dim): -self.action_dim],
                     z_tgt_for_loss[:, :, :, -(self.proprio_dim + self.action_dim): -self.action_dim]
                 )
                 z_loss = self.emb_criterion(
-                    z_pred[:, :, :, :-self.action_dim], 
+                    z_pred[:, :, :, :-self.action_dim],
                     z_tgt_for_loss[:, :, :, :-self.action_dim]
                 )
 
@@ -362,6 +432,15 @@ class VWorldModel(nn.Module):
                 loss_components["z_vicreg_cov_loss"] = z_cov_loss
                 loss_components["z_vcreg_loss_scaled"] = z_reg_loss
                 loss = loss + z_reg_loss
+
+            if self.use_sigreg and self.sigreg_weight > 0:
+                feats = self.visual_only(z_pred)  # (b, t, p, d)
+                # SIGReg expects (T, B, D) — flatten patches into batch dim
+                b, t, p, d = feats.shape
+                proj = feats.reshape(t, b * p, d)
+                sigreg_loss = self.sigreg(proj)
+                loss = loss + sigreg_loss * self.sigreg_weight
+                loss_components["sigreg_loss"] = sigreg_loss
 
             if self.straighten and self.straighten_scale > 0:
                 feats = self.visual_only(z)
@@ -397,6 +476,11 @@ class VWorldModel(nn.Module):
         return z_pred, visual_pred, visual_reconstructed, loss, loss_components
 
     def replace_actions_from_z(self, z, act):
+        if self.use_conditional_predictor:
+            # No action tokens in z; update stored _act_emb instead
+            act_emb = self.encode_act(act)
+            self._act_emb = act_emb
+            return z
         act_emb = self.encode_act(act)
         if self.concat_dim == 0:
             z[:, :, -1, :] = act_emb
@@ -417,19 +501,32 @@ class VWorldModel(nn.Module):
         """
         num_obs_init = obs_0['visual'].shape[1]
         act_0 = act[:, :num_obs_init]
-        action = act[:, num_obs_init:] 
+        action = act[:, num_obs_init:]
         z = self.encode(obs_0, act_0)
         t = 0
         inc = 1
         while t < action.shape[1]:
-            z_pred = self.predict(z[:, -self.num_hist :])
-            z_new = z_pred[:, -inc:, ...]
-            z_new = self.replace_actions_from_z(z_new, action[:, t : t + inc, :])
+            if self.use_conditional_predictor:
+                act_emb_step = self.encode_act(action[:, t : t + inc, :])
+                # Build conditioning from last num_hist frames' actions + new action
+                act_emb_ctx = self._act_emb[:, -(self.num_hist - inc):]
+                act_emb_for_pred = torch.cat([act_emb_ctx, act_emb_step], dim=1)
+                z_pred = self.predict(z[:, -self.num_hist :], act_emb=act_emb_for_pred)
+                z_new = z_pred[:, -inc:, ...]
+                # Update stored action embeddings
+                self._act_emb = torch.cat([self._act_emb, act_emb_step], dim=1)
+            else:
+                z_pred = self.predict(z[:, -self.num_hist :])
+                z_new = z_pred[:, -inc:, ...]
+                z_new = self.replace_actions_from_z(z_new, action[:, t : t + inc, :])
             z = torch.cat([z, z_new], dim=1)
             t += inc
 
-        z_pred = self.predict(z[:, -self.num_hist :])
-        z_new = z_pred[:, -1 :, ...] # take only the next pred
+        if self.use_conditional_predictor:
+            z_pred = self.predict(z[:, -self.num_hist :], act_emb=self._act_emb[:, -self.num_hist:])
+        else:
+            z_pred = self.predict(z[:, -self.num_hist :])
+        z_new = z_pred[:, -1 :, ...]
         z = torch.cat([z, z_new], dim=1)
         z_obses, z_acts = self.separate_emb(z)
         return z_obses, z

@@ -48,6 +48,10 @@ training:
   vcreg_apply_to: "enc"
   vcreg_std_coeff: 0
   vcreg_cov_coeff: 0
+  sigreg: False
+  sigreg_weight: 0.09
+  sigreg_knots: 17
+  sigreg_num_proj: 1024
   mixed_precision: bf16
 
 img_size: 224 # should be a multiple of 224

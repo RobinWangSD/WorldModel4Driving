@@ -313,21 +313,31 @@ class Trainer:
             num_side_patches = self.cfg.img_size // decoder_scale
             num_patches = num_side_patches**2
 
+        is_conditional = "conditional_vit" in self.cfg.predictor.get("_target_", "")
+
         if self.cfg.concat_dim == 0:
-            num_patches += 2
+            if is_conditional:
+                num_patches += 1  # proprio token only, no action token
+            else:
+                num_patches += 2
 
         if self.cfg.has_predictor:
             if self.predictor is None:
+                if is_conditional:
+                    # ConditionalViTPredictor: actions passed separately via AdaLN-zero
+                    pred_dim = self.encoder.emb_dim + (
+                        proprio_emb_dim * self.cfg.num_proprio_repeat
+                    ) * (self.cfg.concat_dim)
+                else:
+                    pred_dim = self.encoder.emb_dim + (
+                        proprio_emb_dim * self.cfg.num_proprio_repeat
+                        + action_emb_dim * self.cfg.num_action_repeat
+                    ) * (self.cfg.concat_dim)
                 self.predictor = hydra.utils.instantiate(
                     self.cfg.predictor,
                     num_patches=num_patches,
                     num_frames=self.cfg.num_hist,
-                    dim=self.encoder.emb_dim
-                    + (
-                        proprio_emb_dim * self.cfg.num_proprio_repeat
-                        + action_emb_dim * self.cfg.num_action_repeat
-                    )
-                    * (self.cfg.concat_dim),
+                    dim=pred_dim,
                 )
             if not self.train_predictor:
                 for param in self.predictor.parameters():
@@ -383,6 +393,10 @@ class Trainer:
             vcreg_std_coeff=self.cfg.training.get("vcreg_std_coeff", 0),
             vcreg_cov_coeff=self.cfg.training.get("vcreg_cov_coeff", 0),
             vcreg_apply_to=self.cfg.training.get("vcreg_apply_to", "enc"),
+            sigreg=self.cfg.training.get("sigreg", False),
+            sigreg_weight=self.cfg.training.get("sigreg_weight", 0.09),
+            sigreg_knots=self.cfg.training.get("sigreg_knots", 17),
+            sigreg_num_proj=self.cfg.training.get("sigreg_num_proj", 1024),
         )
         self._log_trainable_params(self.model, "model")
 
