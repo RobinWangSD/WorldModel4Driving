@@ -149,26 +149,22 @@ class DrivoRAgent(AbstractAgent):
 
     def get_sensor_config(self) :
         """Inherited, see superclass."""
-        # return SensorConfig(
-        #     cam_f0=[3],
-        #     cam_l0=[3],
-        #     cam_l1=[],
-        #     cam_l2=[],
-        #     cam_r0=[3],
-        #     cam_r1=[],
-        #     cam_r2=[],
-        #     cam_b0=[3],
-        #     lidar_pc=[],
-        # )
+        cam_configs = {}
+        for cam_name in ["cam_f0", "cam_l0", "cam_l1", "cam_l2", "cam_r0", "cam_r1", "cam_r2", "cam_b0"]:
+            cam_configs[cam_name] = OmegaConf.to_object(self._config[cam_name])
+
+        # When latent learning is enabled, merge history frame indices into
+        # each active camera so NAVSIM loads those frames' images.
+        latent_cfg = self._config.get("latent_learning", None)
+        if latent_cfg is not None and latent_cfg.get("enabled", False):
+            history_indices = OmegaConf.to_object(latent_cfg.get("history_frame_indices", [1, 2, 3]))
+            for cam_name, frames in cam_configs.items():
+                if len(frames) > 0:
+                    merged = sorted(set(frames) | set(history_indices))
+                    cam_configs[cam_name] = merged
+
         return SensorConfig(
-            cam_f0=OmegaConf.to_object(self._config["cam_f0"]),
-            cam_l0=OmegaConf.to_object(self._config["cam_l0"]),
-            cam_l1=OmegaConf.to_object(self._config["cam_l1"]),
-            cam_l2=OmegaConf.to_object(self._config["cam_l2"]),
-            cam_r0=OmegaConf.to_object(self._config["cam_r0"]),
-            cam_r1=OmegaConf.to_object(self._config["cam_r1"]),
-            cam_r2=OmegaConf.to_object(self._config["cam_r2"]),
-            cam_b0=OmegaConf.to_object(self._config["cam_b0"]),
+            **cam_configs,
             lidar_pc=OmegaConf.to_object(self._config["lidar_pc"]),
         )
     

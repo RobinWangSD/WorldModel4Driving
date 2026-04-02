@@ -6,6 +6,8 @@ from .score_module.scorer import Scorer
 from .transformer_decoder import TransformerDecoder, TransformerDecoderScorer
 from .layers.image_encoder.dinov2_lora import ImgEncoder
 from .layers.utils.mlp import MLP
+from .layers.latent_predictor import LatentPredictor
+from .layers.losses.latent_loss import LatentLoss
 from navsim.agents.drivoR.utils import pylogger
 log = pylogger.get_pylogger(__name__)
 import logging
@@ -103,6 +105,28 @@ class DrivoRModel(nn.Module):
 
         self.b2d=config.b2d
 
+        # Latent space learning (optional)
+        latent_cfg = config.get("latent_learning", None)
+        self.use_latent = latent_cfg is not None and latent_cfg.get("enabled", False)
+        if self.use_latent:
+            pred_cfg = latent_cfg.get("predictor", {})
+            self.latent_predictor = LatentPredictor(
+                d_model=config.tf_d_model,
+                nhead=pred_cfg.get("nhead", 4),
+                num_layers=pred_cfg.get("num_layers", 2),
+                d_ffn=pred_cfg.get("d_ffn", 512),
+                ego_dim=11,
+            )
+            loss_w = latent_cfg.get("loss_weights", {})
+            self.latent_loss_fn = LatentLoss(
+                prediction_weight=loss_w.get("prediction", 1.0),
+                straightening_weight=loss_w.get("straightening", 0.0),
+                vcreg_std_weight=loss_w.get("vcreg_std", 0.0),
+                vcreg_cov_weight=loss_w.get("vcreg_cov", 0.0),
+                stop_grad_target=latent_cfg.get("stop_grad_target", True),
+            )
+            self.freeze_history_backbone = latent_cfg.get("freeze_history_backbone", True)
+
 
     def forward(self, features: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         
@@ -149,6 +173,11 @@ class DrivoRModel(nn.Module):
 
         scene_features = torch.cat(scene_features, dim=1)
         log.debug(f"Scene features - {scene_features.shape}")
+
+        # Latent space learning: encode history frames and predict next-frame tokens
+        latent_loss_dict = None
+        if self.use_latent and self.training and "image_history" in features:
+            latent_loss_dict = self._compute_latent_loss(features, batch_size)
 
         # initial trajectories
         proposals = self.traj_head[0](traj_tokens).reshape(traj_tokens.shape[0], -1, self.poses_num, self.state_size)
@@ -202,7 +231,48 @@ class DrivoRModel(nn.Module):
         output["trajectory"] = trajectory
         output["pdm_score"] = pdm_score
 
+        if latent_loss_dict is not None:
+            output["latent_loss_dict"] = latent_loss_dict
+
         return output
+
+    def _compute_latent_loss(self, features, batch_size):
+        """Encode multiple history frames and compute latent prediction losses."""
+        img_hist = features["image_history"]  # (B, T, N_cams, C, H, W)
+        B, T = img_hist.shape[:2]
+
+        # Flatten batch and time for a single backbone pass
+        img_flat = img_hist.reshape(B * T, *img_hist.shape[2:])
+        scene_tok_rep = self.scene_embeds.repeat(B * T, 1, 1, 1)
+
+        if self.freeze_history_backbone:
+            # Encode all frames without grad, then re-encode last frame with grad
+            with torch.no_grad():
+                all_tokens = self.image_backbone(img_flat, scene_tok_rep)
+            all_tokens = all_tokens.reshape(B, T, -1, self.embed_dims)
+            # Re-encode last frame with gradients so the encoder still gets latent signal
+            last_tok = self.scene_embeds.repeat(B, 1, 1, 1)
+            last_encoded = self.image_backbone(img_hist[:, -1], last_tok)
+            all_tokens = torch.cat([all_tokens[:, :-1], last_encoded.unsqueeze(1)], dim=1)
+        else:
+            all_tokens = self.image_backbone(img_flat, scene_tok_rep)
+            all_tokens = all_tokens.reshape(B, T, -1, self.embed_dims)
+
+        # Per-frame ego status: (B, num_statuses, 11)
+        ego_status = features["ego_status"]  # (B, 4, 11)
+
+        # Predict next-frame tokens for each consecutive pair
+        predicted_list, target_list = [], []
+        for t in range(T - 1):
+            ego_t = ego_status[:, t] if ego_status.dim() == 3 else ego_status
+            pred_t = self.latent_predictor(all_tokens[:, t], ego_t)
+            predicted_list.append(pred_t)
+            target_list.append(all_tokens[:, t + 1])
+
+        predicted = torch.stack(predicted_list, dim=1)  # (B, T-1, N_tokens, D)
+        targets = torch.stack(target_list, dim=1)
+
+        return self.latent_loss_fn(predicted, targets, all_tokens)
 
 
 

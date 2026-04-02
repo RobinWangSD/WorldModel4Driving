@@ -64,24 +64,20 @@ class DrivoRFeatureBuilder(AbstractFeatureBuilder):
 
         return features
 
-    def _get_camera_feature(self, agent_input: AgentInput) -> torch.Tensor:
+    def _process_single_frame_cameras(self, frame_cameras):
         """
-        Extract stitched camera from AgentInput
-        :param agent_input: input dataclass
-        :return: stitched front view image as torch tensor
+        Process cameras from a single frame into tensors.
+        :param frame_cameras: camera data for one frame
+        :return: tuple of (images, cam_Ks, lidar2cams) tensors
         """
-
-        cameras = agent_input.cameras[-1]
-
-        # cameras = [cameras.cam_b0, cameras.cam_f0, cameras.cam_l0, cameras.cam_l1, cameras.cam_l2, cameras.cam_r0, cameras.cam_r1, cameras.cam_r2]
-
-        # this is a change for the focus front cam
-        cameras = [cameras.cam_f0, cameras.cam_b0, cameras.cam_l0, cameras.cam_l1, cameras.cam_l2, cameras.cam_r0, cameras.cam_r1, cameras.cam_r2]
+        cam_list = [frame_cameras.cam_f0, frame_cameras.cam_b0, frame_cameras.cam_l0,
+                     frame_cameras.cam_l1, frame_cameras.cam_l2, frame_cameras.cam_r0,
+                     frame_cameras.cam_r1, frame_cameras.cam_r2]
 
         images = []
         cam_Ks = []
         lidar2cams = []
-        for cam in cameras:
+        for cam in cam_list:
             if cam.image is None:
                 continue
 
@@ -96,7 +92,7 @@ class DrivoRFeatureBuilder(AbstractFeatureBuilder):
 
             # intrinsics resize
             original_size = im.size
-            cam_K = cam_K.clone() if isinstance(cam_K, torch.Tensor) else cam_K.copy() # torch.Size([8, 3, 3])
+            cam_K = cam_K.clone() if isinstance(cam_K, torch.Tensor) else cam_K.copy()
             cam_K[0, 0] = cam_K[0, 0] * self._config.image_size[0] / original_size[0]
             cam_K[1, 1] = cam_K[1, 1] * self._config.image_size[1] / original_size[1]
             cam_K[0, 2] = cam_K[0, 2] * self._config.image_size[0] / original_size[0]
@@ -120,24 +116,33 @@ class DrivoRFeatureBuilder(AbstractFeatureBuilder):
             cam_Ks.append(cam_K)
             lidar2cams.append(lidar2cam_rt)
 
+        return torch.stack(images), torch.stack(cam_Ks), torch.stack(lidar2cams)
 
-        # Collect all camera images in a list for easier processing
+    def _get_camera_feature(self, agent_input: AgentInput) -> torch.Tensor:
+        """
+        Extract camera features from AgentInput.
+        Returns the last frame's images, and optionally multi-frame image_history
+        for latent space learning.
+        """
+        # Last frame (used by the main pipeline)
+        images, cam_Ks, lidar2cams = self._process_single_frame_cameras(agent_input.cameras[-1])
         data = {
-            "image": torch.stack(images),
-            "cam_K": torch.stack(cam_Ks),
-            "world_2_cam": torch.stack(lidar2cams)
+            "image": images,
+            "cam_K": cam_Ks,
+            "world_2_cam": lidar2cams,
         }
-        
-        # raise NotImplementedError
 
-
-        # data["image"] = torch.stack([transforms.ToTensor()(img) for img in data["image"]])
-        # data["cam_K"] = torch.stack([torch.from_numpy(cam) for cam in data["cam_K"]])
-        # data["world_2_cam"] = torch.stack([torch.from_numpy(world_2_cam) for world_2_cam in data["world_2_cam"]])
-
-        # data["image"] = data["image"].unsqueeze(0) # add time dimension
-        # data["cam_K"] = data["cam_K"].unsqueeze(0) # add time dimension
-        # data["world_2_cam"] = data["world_2_cam"].unsqueeze(0) # add time dimension
+        # Multi-frame history for latent learning
+        latent_cfg = getattr(self._config, "latent_learning", None)
+        if latent_cfg is not None and latent_cfg.get("enabled", False):
+            frame_indices = latent_cfg.get("history_frame_indices", [1, 2, 3])
+            history_images = []
+            for idx in frame_indices:
+                if idx < len(agent_input.cameras) and agent_input.cameras[idx] is not None:
+                    frame_imgs, _, _ = self._process_single_frame_cameras(agent_input.cameras[idx])
+                    history_images.append(frame_imgs)
+            if history_images:
+                data["image_history"] = torch.stack(history_images)  # (T, N_cams, C, H, W)
 
         return data
 
