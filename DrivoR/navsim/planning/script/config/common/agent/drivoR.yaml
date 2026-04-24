@@ -94,6 +94,22 @@ config:
     time_horizon: 4
     interval_length: 0.5
 
+  latent_learning:
+    enabled: true
+    one_step: true                  # true = only (o_t, o_{t+1}); false = history (not implemented yet)
+    freeze_history_backbone: false  # kept for future history mode; irrelevant when one_step=true
+    history_frame_indices: [2]      # o_t = cameras[2] (previous frame). cameras[3] is cameras[-1] = features["image"] = o_{t+1}
+    predictor:
+      nhead: 4
+      num_layers: 2
+      d_ffn: 512
+    loss_weights:
+      prediction: 1.0
+      straightening: 0.0
+      vcreg_std: 0.0
+      vcreg_cov: 0.0
+    stop_grad_target: true
+
 
 
 loss:
@@ -110,6 +126,7 @@ loss:
   agent_box_weight: 0.1
   bev_semantic_weight: 1.0
   div_weight: 0.0
+  latent_weight: 1.0
 
 
 checkpoint_path: ''

@@ -109,6 +109,7 @@ class DrivoRModel(nn.Module):
         latent_cfg = config.get("latent_learning", None)
         self.use_latent = latent_cfg is not None and latent_cfg.get("enabled", False)
         if self.use_latent:
+            self.one_step = latent_cfg.get("one_step", True)
             pred_cfg = latent_cfg.get("predictor", {})
             self.latent_predictor = LatentPredictor(
                 d_model=config.tf_d_model,
@@ -147,9 +148,11 @@ class DrivoRModel(nn.Module):
 
 
         scene_features = []
+        cur_tokens = None
+        want_latent = self.use_latent and self.training and "image_history" in features
         # image features
         if self.num_cams > 0:
-            
+
             if "image" in features :
                 img = features["image"]
             elif "camera_feature" in features:
@@ -157,8 +160,17 @@ class DrivoRModel(nn.Module):
             else:
                 raise ValueError
 
-            scene_tokens = self.scene_embeds.repeat(batch_size, 1, 1, 1)
-            image_scene_tokens = self.image_backbone(img, scene_tokens)
+            if want_latent and self.one_step:
+                # Batch o_t and o_{t+1} through the backbone in a single call.
+                o_t = features["image_history"][:, 0]
+                img_pair = torch.cat([img, o_t], dim=0)
+                scene_tokens = self.scene_embeds.repeat(img_pair.shape[0], 1, 1, 1)
+                pair_tokens = self.image_backbone(img_pair, scene_tokens)
+                image_scene_tokens = pair_tokens[:batch_size]
+                cur_tokens = pair_tokens[batch_size:]
+            else:
+                scene_tokens = self.scene_embeds.repeat(batch_size, 1, 1, 1)
+                image_scene_tokens = self.image_backbone(img, scene_tokens)
 
             log.debug(f"Backbone image - {image_scene_tokens.shape}")
             scene_features.append(image_scene_tokens)
@@ -174,10 +186,10 @@ class DrivoRModel(nn.Module):
         scene_features = torch.cat(scene_features, dim=1)
         log.debug(f"Scene features - {scene_features.shape}")
 
-        # Latent space learning: encode history frames and predict next-frame tokens
+        # Latent space learning: predict next-frame scene tokens from current scene tokens.
         latent_loss_dict = None
-        if self.use_latent and self.training and "image_history" in features:
-            latent_loss_dict = self._compute_latent_loss(features, batch_size)
+        if want_latent:
+            latent_loss_dict = self._compute_latent_loss(features, cur_tokens, image_scene_tokens)
 
         # initial trajectories
         proposals = self.traj_head[0](traj_tokens).reshape(traj_tokens.shape[0], -1, self.poses_num, self.state_size)
@@ -236,43 +248,27 @@ class DrivoRModel(nn.Module):
 
         return output
 
-    def _compute_latent_loss(self, features, batch_size):
-        """Encode multiple history frames and compute latent prediction losses."""
-        img_hist = features["image_history"]  # (B, T, N_cams, C, H, W)
-        B, T = img_hist.shape[:2]
+    def _compute_latent_loss(self, features, cur_tokens, target_tokens):
+        """Predict next-frame scene tokens from previous-frame scene tokens.
 
-        # Flatten batch and time for a single backbone pass
-        img_flat = img_hist.reshape(B * T, *img_hist.shape[2:])
-        scene_tok_rep = self.scene_embeds.repeat(B * T, 1, 1, 1)
+        cur_tokens:    (B, N_tokens, D) — o_t scene tokens (encoded in main forward)
+        target_tokens: (B, N_tokens, D) — o_{t+1} scene tokens (= image_scene_tokens)
+        """
+        if not self.one_step:
+            raise NotImplementedError("history mode not implemented yet")
 
-        if self.freeze_history_backbone:
-            # Encode all frames without grad, then re-encode last frame with grad
-            with torch.no_grad():
-                all_tokens = self.image_backbone(img_flat, scene_tok_rep)
-            all_tokens = all_tokens.reshape(B, T, -1, self.embed_dims)
-            # Re-encode last frame with gradients so the encoder still gets latent signal
-            last_tok = self.scene_embeds.repeat(B, 1, 1, 1)
-            last_encoded = self.image_backbone(img_hist[:, -1], last_tok)
-            all_tokens = torch.cat([all_tokens[:, :-1], last_encoded.unsqueeze(1)], dim=1)
-        else:
-            all_tokens = self.image_backbone(img_flat, scene_tok_rep)
-            all_tokens = all_tokens.reshape(B, T, -1, self.embed_dims)
+        ego_status = features["ego_status"]
+        # ego at t (aligned with o_t = cameras[2]); index -2 in the length-4 history
+        ego_t = ego_status[:, -2] if ego_status.dim() == 3 else ego_status
 
-        # Per-frame ego status: (B, num_statuses, 11)
-        ego_status = features["ego_status"]  # (B, 4, 11)
+        predicted = self.latent_predictor(cur_tokens, ego_t)  # (B, N_tokens, D)
 
-        # Predict next-frame tokens for each consecutive pair
-        predicted_list, target_list = [], []
-        for t in range(T - 1):
-            ego_t = ego_status[:, t] if ego_status.dim() == 3 else ego_status
-            pred_t = self.latent_predictor(all_tokens[:, t], ego_t)
-            predicted_list.append(pred_t)
-            target_list.append(all_tokens[:, t + 1])
-
-        predicted = torch.stack(predicted_list, dim=1)  # (B, T-1, N_tokens, D)
-        targets = torch.stack(target_list, dim=1)
-
-        return self.latent_loss_fn(predicted, targets, all_tokens)
+        # LatentLoss expects a time dim; unsqueeze so straightening (which needs T>=3) stays off.
+        return self.latent_loss_fn(
+            predicted.unsqueeze(1),
+            target_tokens.unsqueeze(1),
+            cur_tokens.unsqueeze(1),
+        )
 
 
 
