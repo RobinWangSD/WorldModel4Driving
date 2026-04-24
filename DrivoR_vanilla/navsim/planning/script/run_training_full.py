@@ -182,7 +182,7 @@ def main(cfg: DictConfig) -> None:
             name=run_name,
             project='drivoR_training',
             entity='luw015',
-            log_model=True,
+            log_model="all",
             save_dir=cfg.output_dir,
         )
     else:

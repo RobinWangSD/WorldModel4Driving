@@ -288,15 +288,16 @@ class DrivoRAgent(AbstractAgent):
         checkpoint_cb_best = ModelCheckpoint(save_top_k=1,
                                         monitor='val/score_epoch',
                                         filename='best-{epoch}-{step}',
-                                        mode="max"
+                                        mode="max",
+                                        dirpath="/dev/shm/ckpts"  # tmpfs (RAM); wandb uploads to cloud
                                         )
-        
-        checkpoint_cb = ModelCheckpoint(save_last=True)
 
-        lr_monitor = LearningRateMonitor(logging_interval="step", 
+        checkpoint_cb = ModelCheckpoint(save_last=True, dirpath="/dev/shm/ckpts")
+
+        lr_monitor = LearningRateMonitor(logging_interval="step",
                                             log_momentum=False,
                                             log_weight_decay=False)
-        
+
         if self.progress_bar:
             return [checkpoint_cb_best, checkpoint_cb, lr_monitor]
         else:
