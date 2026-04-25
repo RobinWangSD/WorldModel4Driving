@@ -121,23 +121,30 @@ class DrivoRFeatureBuilder(AbstractFeatureBuilder):
             lidar2cams.append(lidar2cam_rt)
 
 
-        # Collect all camera images in a list for easier processing
         data = {
             "image": torch.stack(images),
             "cam_K": torch.stack(cam_Ks),
             "world_2_cam": torch.stack(lidar2cams)
         }
-        
-        # raise NotImplementedError
 
-
-        # data["image"] = torch.stack([transforms.ToTensor()(img) for img in data["image"]])
-        # data["cam_K"] = torch.stack([torch.from_numpy(cam) for cam in data["cam_K"]])
-        # data["world_2_cam"] = torch.stack([torch.from_numpy(world_2_cam) for world_2_cam in data["world_2_cam"]])
-
-        # data["image"] = data["image"].unsqueeze(0) # add time dimension
-        # data["cam_K"] = data["cam_K"].unsqueeze(0) # add time dimension
-        # data["world_2_cam"] = data["world_2_cam"].unsqueeze(0) # add time dimension
+        latent_cfg = getattr(self._config, "latent_learning", None)
+        if latent_cfg is not None and latent_cfg.get("enabled", False):
+            if agent_input.next_cameras is not None:
+                nc = agent_input.next_cameras
+                next_cam_list = [nc.cam_f0, nc.cam_b0, nc.cam_l0, nc.cam_l1,
+                                 nc.cam_l2, nc.cam_r0, nc.cam_r1, nc.cam_r2]
+                next_imgs = []
+                for cam in next_cam_list:
+                    if cam.image is None:
+                        continue
+                    im = Image.fromarray(cam.image)
+                    im = im.resize(self._config.image_size)
+                    im = np.asarray(im, dtype=np.float32) / 255.0
+                    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+                    std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+                    im = (im - mean) / std
+                    next_imgs.append(torch.from_numpy(im).permute(2, 0, 1))
+                data["image_next"] = torch.stack(next_imgs)  # (N_cams, C, H, W) — o_{t+1}
 
         return data
 

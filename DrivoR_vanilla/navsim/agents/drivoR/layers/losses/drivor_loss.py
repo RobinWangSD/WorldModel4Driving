@@ -133,9 +133,11 @@ class DrivoRLoss(torch.nn.Module):
                         agent_class_weight: float = 1.0,
                         agent_box_weight: float = 1.0,
                         bev_semantic_weight: float = 1.0,
+                        latent_weight: float = 0.0,
                         **kwargs):
         super().__init__()
 
+        self.latent_weight = latent_weight
         self.trajectory_weight = trajectory_weight
         self.inter_weight = inter_weight
         self.sub_score_weight = sub_score_weight
@@ -314,8 +316,10 @@ class DrivoRLoss(torch.nn.Module):
                 + self.agent_class_weight * agent_class_loss
                 + self.agent_box_weight * agent_box_loss
                 + self.bev_semantic_weight * bev_semantic_loss
-
         )
+
+        if self.latent_weight > 0 and "latent_loss_dict" in pred:
+            loss = loss + self.latent_weight * pred["latent_loss_dict"]["loss"]
 
         pdm_score = pred["pdm_score"].detach()
         top_proposals = torch.argmax(pdm_score, dim=1)
@@ -347,5 +351,9 @@ class DrivoRLoss(torch.nn.Module):
             "score": score,
             "best_score": best_score
         }
+
+        if "latent_loss_dict" in pred:
+            for k, v in pred["latent_loss_dict"].items():
+                loss_dict[f"latent_{k}"] = v
 
         return loss_dict

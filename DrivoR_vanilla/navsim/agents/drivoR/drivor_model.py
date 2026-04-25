@@ -6,6 +6,8 @@ from .score_module.scorer import Scorer
 from .transformer_decoder import TransformerDecoder, TransformerDecoderScorer
 from .layers.image_encoder.dinov2_lora import ImgEncoder
 from .layers.utils.mlp import MLP
+from .layers.latent_predictor import LatentPredictor
+from .layers.losses.latent_loss import LatentLoss
 from navsim.agents.drivoR.utils import pylogger
 log = pylogger.get_pylogger(__name__)
 import logging
@@ -103,6 +105,25 @@ class DrivoRModel(nn.Module):
 
         self.b2d=config.b2d
 
+        # Latent space learning (optional)
+        latent_cfg = config.get("latent_learning", None)
+        self.use_latent = latent_cfg is not None and latent_cfg.get("enabled", False)
+        if self.use_latent:
+            self.one_step = latent_cfg.get("one_step", True)
+            pred_cfg = latent_cfg.get("predictor", {})
+            self.latent_predictor = LatentPredictor(
+                d_model=config.tf_d_model,
+                nhead=pred_cfg.get("nhead", 4),
+                num_layers=pred_cfg.get("num_layers", 2),
+                d_ffn=pred_cfg.get("d_ffn", 512),
+                ego_dim=11,
+            )
+            loss_w = latent_cfg.get("loss_weights", {})
+            self.latent_loss_fn = LatentLoss(
+                prediction_weight=loss_w.get("prediction", 1.0),
+                stop_grad_target=latent_cfg.get("stop_grad_target", True),
+            )
+
 
     def forward(self, features: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         
@@ -123,18 +144,28 @@ class DrivoRModel(nn.Module):
 
 
         scene_features = []
+        next_tokens = None
+        want_latent = self.use_latent and self.training and "image_next" in features
         # image features
         if self.num_cams > 0:
-            
-            if "image" in features :
+            if "image" in features:
                 img = features["image"]
             elif "camera_feature" in features:
                 img = features["camera_feature"]
             else:
                 raise ValueError
 
-            scene_tokens = self.scene_embeds.repeat(batch_size, 1, 1, 1)
-            image_scene_tokens = self.image_backbone(img, scene_tokens)
+            if want_latent and self.one_step:
+                # Encode o_t and o_{t+1} in one backbone call.
+                img_next = features["image_next"]
+                img_pair = torch.cat([img, img_next], dim=0)
+                scene_tokens = self.scene_embeds.repeat(img_pair.shape[0], 1, 1, 1)
+                pair_tokens = self.image_backbone(img_pair, scene_tokens)
+                image_scene_tokens = pair_tokens[:batch_size]   # o_t → policy + predictor input
+                next_tokens = pair_tokens[batch_size:]           # o_{t+1} → latent target
+            else:
+                scene_tokens = self.scene_embeds.repeat(batch_size, 1, 1, 1)
+                image_scene_tokens = self.image_backbone(img, scene_tokens)
 
             log.debug(f"Backbone image - {image_scene_tokens.shape}")
             scene_features.append(image_scene_tokens)
@@ -149,6 +180,11 @@ class DrivoRModel(nn.Module):
 
         scene_features = torch.cat(scene_features, dim=1)
         log.debug(f"Scene features - {scene_features.shape}")
+
+        # Latent transition model: p(o_{t+1} | o_t, a_t)
+        latent_loss_dict = None
+        if want_latent:
+            latent_loss_dict = self._compute_latent_loss(features, image_scene_tokens, next_tokens)
 
         # initial trajectories
         proposals = self.traj_head[0](traj_tokens).reshape(traj_tokens.shape[0], -1, self.poses_num, self.state_size)
@@ -202,7 +238,17 @@ class DrivoRModel(nn.Module):
         output["trajectory"] = trajectory
         output["pdm_score"] = pdm_score
 
+        if latent_loss_dict is not None:
+            output["latent_loss_dict"] = latent_loss_dict
+
         return output
+
+    def _compute_latent_loss(self, features, cur_tokens, next_tokens):
+        """p(o_{t+1} | o_t, a_t): predict next-frame tokens from current scene tokens."""
+        ego_status = features["ego_status"]
+        ego_t = ego_status[:, -1] if ego_status.dim() == 3 else ego_status
+        predicted = self.latent_predictor(cur_tokens, ego_t)
+        return self.latent_loss_fn(predicted.unsqueeze(1), next_tokens.unsqueeze(1))
 
 
 

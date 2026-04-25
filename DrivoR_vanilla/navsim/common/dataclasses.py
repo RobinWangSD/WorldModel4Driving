@@ -146,6 +146,7 @@ class AgentInput:
     ego_statuses: List[EgoStatus]
     cameras: List[Cameras]
     lidars: List[Lidar]
+    next_cameras: Optional[Cameras] = None  # o_{t+1}, set during training when future frames are available
 
     @classmethod
     def from_scene_dict_list(
@@ -391,7 +392,10 @@ class Scene:
             cameras.append(self.frames[frame_idx].cameras)
             lidars.append(self.frames[frame_idx].lidar)
 
-        return AgentInput(ego_statuses, cameras, lidars)
+        agent_input = AgentInput(ego_statuses, cameras, lidars)
+        if len(self.frames) > self.scene_metadata.num_history_frames:
+            agent_input.next_cameras = self.frames[self.scene_metadata.num_history_frames].cameras
+        return agent_input
 
     @classmethod
     def _build_map_api(cls, map_name: str) -> AbstractMap:
