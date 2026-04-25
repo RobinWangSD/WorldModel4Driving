@@ -29,14 +29,14 @@ config:
 
   ####################
   # sensor config
-  cam_f0: [3]
-  cam_l0: [3]
+  cam_f0: [3, 4]
+  cam_l0: [3, 4]
   cam_l1: []
   cam_l2: []
-  cam_r0: [3]
+  cam_r0: [3, 4]
   cam_r1: []
   cam_r2: []
-  cam_b0: [3]
+  cam_b0: [3, 4]
   lidar_pc: []
 
 

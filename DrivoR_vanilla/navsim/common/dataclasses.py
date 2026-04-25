@@ -466,8 +466,7 @@ class Scene:
             global_ego_status = cls._build_ego_status(scene_dict_list[frame_idx])
             annotations = cls._build_annotations(scene_dict_list[frame_idx])
 
-            sensor_query_idx = min(frame_idx, num_history_frames - 1)
-            sensor_names = sensor_config.get_sensors_at_iteration(sensor_query_idx)
+            sensor_names = sensor_config.get_sensors_at_iteration(frame_idx)
 
             cameras = Cameras.from_camera_dict(
                 sensor_blobs_path=sensor_blobs_path,

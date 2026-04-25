@@ -1,0 +1,51 @@
+{
+    'token':                                <str> -- Unique record identifier. Pointing to the nuPlan lidar_pc.
+    'frame_idx':                            <int> -- Indicates the idx of the current frame.
+    'timestamp':                            <int> -- Unix time stamp.
+    'log_name':                             <str> -- Short string identifier.
+    'log_token':                            <str> -- Foreign key pointing to the nuPlan log.
+    'scene_name':                           <str> -- Short string identifier.
+    'scene_token':                          <str> -- Foreign key pointing to the nuPlan scene.
+    'map_location':                         <str> -- Area where log was captured.
+    'roadblock_ids':                        <list> -- A sequence of roadblock ids separated by commas. The ids can be looked up in the nuPlan Map API.
+    'vehicle_name':                         <str> -- String identifier for the current car.
+    'can_bus':                              <list> -- Used for vehicle communications, including low-level information about position, speed, acceleration, steering, lights, batteries, etc.
+    'lidar_path':                           <str> -- The relative address to store the lidar data.
+    'lidar2ego_translation':                <list> -- Translation matrix from the lidar coordinate system to the ego coordinate system.
+    'lidar2ego_rotation':                   <list> -- Rotation matrix from the lidar coordinate system to the ego coordinate system.
+    'ego2global_translation':               <list> -- Translation matrix from ego coordinate system to global coordinate system
+    'ego2global_rotation':                  <list> -- Rotation matrix from ego coordinate system to global coordinate system
+    'ego_dynamic_state':                    <list> -- The velocity and acceleration of ego car.
+    'traffic_lights':                       <list> -- The status of traffic lights.
+    'driving_command':                      <list> -- The high-level driving command. One-hot with 4-classes: (left, forward, right, unknown).
+    'cams': {
+        'CAM_F0': {
+            'data_path':                    <str> -- The relative address to store the camera_front_0 data.
+            'sensor2lidar_rotation':        <list> -- Rotation matrix from camera_front_0 sensor to lidar coordinate system.
+            'sensor2lidar_translation':     <list> -- Translation matrix from camera_front_0 sensor to lidar coordinate system.
+            'cam_intrinsic':                <list> -- Intrinsic matrix of the camera 
+            'distortion':                   <list> -- The distortion coefficiants of camera.
+        }
+        'CAM_L0':                           <dict> -- Camera configuration.
+        'CAM_R0':                           <dict> -- Camera configuration.
+        'CAM_L1':                           <dict> -- Camera configuration.
+        'CAM_R1':                           <dict> -- Camera configuration.
+        'CAM_L2':                           <dict> -- Camera configuration.
+        'CAM_R2':                           <dict> -- Camera configuration.
+        'CAM_B0':                           <dict> -- Camera configuration.
+    }
+    'sample_prev':                          <str> -- Foreign key. Sample that precedes this in time. Empty if start of scene.
+    'sample_next':                          <str> -- Foreign key. Sample that follows this in time. Empty if end of scene.
+    'ego2global':                           <list> -- Ego to the global coordinate system transformation matrix.
+    'lidar2ego':                            <list> -- Lidar to the ego coordinate system transformation matrix.
+    'lidar2global':                         <list> -- Lidar to the global coordinate system transformation matrix.
+    'anns': {
+        'gt_boxes':                         <list> -- Ground truth boxes. (x,y,z,l,w,h,yaw)
+        'gt_names':                         <list> -- Class names.
+        'gt_velocity_3d':                   <list> -- 3D velocity.
+        'instance_tokens':                  <list> -- Unique record identifier of single frame instance.
+        'track_tokens':                     <list> -- Unique record identifier of tracking instance.
+    }
+    'occ_gt_final_path':                    <str> -- The relative address to store the occupancy gt data.
+    'flow_gt_final_path':                   <str> -- The relative address to store the flow gt data.     
+}

@@ -144,7 +144,8 @@ class DrivoRFeatureBuilder(AbstractFeatureBuilder):
                     std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
                     im = (im - mean) / std
                     next_imgs.append(torch.from_numpy(im).permute(2, 0, 1))
-                data["image_next"] = torch.stack(next_imgs)  # (N_cams, C, H, W) — o_{t+1}
+                if next_imgs:
+                    data["image_next"] = torch.stack(next_imgs)  # (N_cams, C, H, W) — o_{t+1}
 
         return data
 
