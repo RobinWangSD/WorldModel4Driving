@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional, Tuple, BinaryIO, Union
 from dataclasses import dataclass, asdict
 from pathlib import Path
 import io
+import logging
 import os
 
 import numpy as np
@@ -73,13 +74,17 @@ class Cameras:
             camera_identifier = camera_name.lower()
             if camera_identifier in sensor_names:
                 image_path = sensor_blobs_path / camera_dict[camera_name]["data_path"]
-                data_dict[camera_identifier] = Camera(
-                    image=np.array(Image.open(image_path)),
-                    sensor2lidar_rotation=camera_dict[camera_name]["sensor2lidar_rotation"],
-                    sensor2lidar_translation=camera_dict[camera_name]["sensor2lidar_translation"],
-                    intrinsics=camera_dict[camera_name]["cam_intrinsic"],
-                    distortion=camera_dict[camera_name]["distortion"],
-                )
+                try:
+                    data_dict[camera_identifier] = Camera(
+                        image=np.array(Image.open(image_path)),
+                        sensor2lidar_rotation=camera_dict[camera_name]["sensor2lidar_rotation"],
+                        sensor2lidar_translation=camera_dict[camera_name]["sensor2lidar_translation"],
+                        intrinsics=camera_dict[camera_name]["cam_intrinsic"],
+                        distortion=camera_dict[camera_name]["distortion"],
+                    )
+                except FileNotFoundError:
+                    logging.warning(f"Camera image not found, skipping: {image_path}")
+                    data_dict[camera_identifier] = Camera()
             else:
                 data_dict[camera_identifier] = Camera()  # empty camera
 
