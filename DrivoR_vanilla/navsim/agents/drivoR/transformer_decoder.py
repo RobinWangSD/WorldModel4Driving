@@ -38,6 +38,50 @@ class Attention(torch.nn.Module):
         x = self.proj_drop(x)
         return x
 
+
+def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+class DiTBlock(torch.nn.Module):
+    """A DiT block with adaptive layer norm zero conditioning."""
+
+    def __init__(
+            self,
+            dim: int,
+            num_heads: int,
+            mlp_ratio: float = 4.,
+            proj_drop: float = 0.,
+            act_layer: Callable[[], torch.nn.Module] = lambda: torch.nn.GELU(approximate="tanh"),
+            mlp_layer: Type[torch.nn.Module] = Mlp,):
+        super().__init__()
+        self.norm1 = torch.nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.attn = Attention(
+            dim,
+            num_heads=num_heads,
+            proj_drop=proj_drop,
+        )
+        self.norm2 = torch.nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.mlp = mlp_layer(
+            in_features=dim,
+            hidden_features=int(dim * mlp_ratio),
+            act_layer=act_layer,
+            drop=0,
+        )
+        self.adaLN_modulation = torch.nn.Sequential(
+            torch.nn.SiLU(),
+            torch.nn.Linear(dim, 6 * dim, bias=True),
+        )
+        torch.nn.init.zeros_(self.adaLN_modulation[-1].weight)
+        torch.nn.init.zeros_(self.adaLN_modulation[-1].bias)
+
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
+        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        return x
+
+
 class Block(torch.nn.Module):
 
 
@@ -182,6 +226,5 @@ class TransformerDecoderScorer(torch.nn.Module):
             return torch.stack(intermediate)
         else:
             return x
-
 
 

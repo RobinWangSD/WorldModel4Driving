@@ -169,8 +169,10 @@ def test_feature_builder_partial_image_next_invalid():
 def test_latent_predictor():
     print("  [5] LatentPredictor forward shape ...", end=" ")
     from navsim.agents.drivoR.layers.latent_predictor import LatentPredictor
+    from navsim.agents.drivoR.transformer_decoder import DiTBlock
     B, N, D = 2, 16, 64
     predictor = LatentPredictor(d_model=D, nhead=2, num_layers=1, d_ffn=128, ego_dim=11)
+    assert isinstance(predictor.blocks[0], DiTBlock)
     scene_tokens = torch.randn(B, N, D)
     ego_t = torch.randn(B, 11)
     out = predictor(scene_tokens, ego_t)
@@ -178,8 +180,20 @@ def test_latent_predictor():
     print("OK")
 
 
+def test_dit_block():
+    print("  [6] DiTBlock forward shape ...", end=" ")
+    from navsim.agents.drivoR.transformer_decoder import DiTBlock
+    B, N, D = 2, 16, 64
+    block = DiTBlock(dim=D, num_heads=2, mlp_ratio=2.0)
+    x = torch.randn(B, N, D)
+    c = torch.randn(B, D)
+    out = block(x, c)
+    assert out.shape == x.shape, f"expected {x.shape}, got {out.shape}"
+    print("OK")
+
+
 def test_latent_loss():
-    print("  [6] LatentLoss forward, stop_grad_target=True ...", end=" ")
+    print("  [7] LatentLoss forward, stop_grad_target=True ...", end=" ")
     from navsim.agents.drivoR.layers.losses.latent_loss import LatentLoss
     B, T, N, D = 2, 1, 16, 64
     loss_fn = LatentLoss(prediction_weight=1.0, stop_grad_target=True)
@@ -196,7 +210,7 @@ def test_latent_loss():
 
 
 def test_model_forward_train_latent():
-    print("  [7] DrivoRModel forward (train, with latent) — shapes and latent_loss_dict ...", end=" ")
+    print("  [8] DrivoRModel forward (train, with latent) — shapes and latent_loss_dict ...", end=" ")
     from navsim.agents.drivoR.drivor_model import DrivoRModel
     cfg = make_config(latent_enabled=True)
     model = DrivoRModel(cfg)
@@ -225,7 +239,7 @@ def test_model_forward_train_latent():
 
 
 def test_model_forward_train_latent_all_invalid_zero():
-    print("  [8] DrivoRModel forward (train, invalid image_next) — zero latent loss ...", end=" ")
+    print("  [9] DrivoRModel forward (train, invalid image_next) — zero latent loss ...", end=" ")
     from navsim.agents.drivoR.drivor_model import DrivoRModel
     cfg = make_config(latent_enabled=True)
     model = DrivoRModel(cfg)
@@ -251,7 +265,7 @@ def test_model_forward_train_latent_all_invalid_zero():
 
 
 def test_model_forward_train_latent_mixed_valid():
-    print("  [9] DrivoRModel forward (train, mixed image_next validity) — masks invalid rows ...", end=" ")
+    print(" [10] DrivoRModel forward (train, mixed image_next validity) — masks invalid rows ...", end=" ")
     from navsim.agents.drivoR.drivor_model import DrivoRModel
     cfg = make_config(latent_enabled=True)
     model = DrivoRModel(cfg)
@@ -287,7 +301,7 @@ def test_model_forward_train_latent_mixed_valid():
 
 
 def test_model_forward_eval_no_latent():
-    print(" [10] DrivoRModel forward (eval, no image_next) — no latent_loss_dict ...", end=" ")
+    print(" [11] DrivoRModel forward (eval, no image_next) — no latent_loss_dict ...", end=" ")
     from navsim.agents.drivoR.drivor_model import DrivoRModel
     cfg = make_config(latent_enabled=True)
     model = DrivoRModel(cfg)
@@ -310,7 +324,7 @@ def test_model_forward_eval_no_latent():
 
 
 def test_model_forward_latent_disabled():
-    print(" [11] DrivoRModel forward (latent disabled in config) — no latent_loss_dict ...", end=" ")
+    print(" [12] DrivoRModel forward (latent disabled in config) — no latent_loss_dict ...", end=" ")
     from navsim.agents.drivoR.drivor_model import DrivoRModel
     cfg = make_config(latent_enabled=False)
     model = DrivoRModel(cfg)
@@ -332,7 +346,7 @@ def test_model_forward_latent_disabled():
 
 
 def test_model_init_one_step_false_not_implemented():
-    print(" [12] DrivoRModel init raises when latent one_step=False ...", end=" ")
+    print(" [13] DrivoRModel init raises when latent one_step=False ...", end=" ")
     from navsim.agents.drivoR.drivor_model import DrivoRModel
     cfg = make_config(latent_enabled=True, one_step=False)
 
@@ -347,7 +361,7 @@ def test_model_init_one_step_false_not_implemented():
 
 
 def test_policy_and_predictor_share_tokens():
-    print(" [13] Policy scene tokens == latent predictor cur_tokens (same tensor path) ...", end=" ")
+    print(" [14] Policy scene tokens == latent predictor cur_tokens (same tensor path) ...", end=" ")
     from navsim.agents.drivoR.drivor_model import DrivoRModel
     cfg = make_config(latent_enabled=True)
     model = DrivoRModel(cfg)
@@ -380,7 +394,7 @@ def test_policy_and_predictor_share_tokens():
 
 
 def test_drivor_loss_latent_keys():
-    print(" [14] DrivoRLoss: latent_weight stored and loss_dict gets latent keys ...", end=" ")
+    print(" [15] DrivoRLoss: latent_weight stored and loss_dict gets latent keys ...", end=" ")
     from navsim.agents.drivoR.layers.losses.drivor_loss import DrivoRLoss
 
     # Verify latent_weight is stored correctly
@@ -414,7 +428,7 @@ def test_drivor_loss_latent_keys():
 
 
 def test_cache_normalizes_legacy_image_next():
-    print(" [15] Cache normalization handles missing, partial, and legacy image_next ...", end=" ")
+    print(" [16] Cache normalization handles missing, partial, and legacy image_next ...", end=" ")
     from navsim.planning.training.dataset import normalize_drivor_image_next
 
     image = torch.randn(4, 3, 56, 56)
@@ -449,6 +463,7 @@ if __name__ == "__main__":
         test_feature_builder_no_image_next_on_eval,
         test_feature_builder_partial_image_next_invalid,
         test_latent_predictor,
+        test_dit_block,
         test_latent_loss,
         test_model_forward_train_latent,
         test_model_forward_train_latent_all_invalid_zero,
