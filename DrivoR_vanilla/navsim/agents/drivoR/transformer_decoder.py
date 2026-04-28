@@ -39,6 +39,42 @@ class Attention(torch.nn.Module):
         return x
 
 
+class DiTSelfAttention(torch.nn.Module):
+    """ViT/DiT-style qkv self-attention for DiTBlock."""
+
+    def __init__(
+            self,
+            dim: int,
+            num_heads: int = 8,
+            qkv_bias: bool = True,
+            attn_drop: float = 0.,
+            proj_drop: float = 0.,
+    ) -> None:
+        super().__init__()
+        assert dim % num_heads == 0, 'dim should be divisible by num_heads'
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.qkv = torch.nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = torch.nn.Dropout(attn_drop)
+        self.proj = torch.nn.Linear(dim, dim)
+        self.proj_drop = torch.nn.Dropout(proj_drop)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
@@ -56,9 +92,10 @@ class DiTBlock(torch.nn.Module):
             mlp_layer: Type[torch.nn.Module] = Mlp,):
         super().__init__()
         self.norm1 = torch.nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.attn = Attention(
+        self.attn = DiTSelfAttention(
             dim,
             num_heads=num_heads,
+            qkv_bias=True,
             proj_drop=proj_drop,
         )
         self.norm2 = torch.nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
@@ -226,5 +263,4 @@ class TransformerDecoderScorer(torch.nn.Module):
             return torch.stack(intermediate)
         else:
             return x
-
 
