@@ -28,6 +28,8 @@ from PIL import Image
 from scipy.interpolate import CubicSpline
 
 class DrivoRFeatureBuilder(AbstractFeatureBuilder):
+    CAMERA_ORDER = ("cam_f0", "cam_b0", "cam_l0", "cam_l1", "cam_l2", "cam_r0", "cam_r1", "cam_r2")
+
     def __init__(self, config: Dict):
         self._config = config
 
@@ -64,6 +66,29 @@ class DrivoRFeatureBuilder(AbstractFeatureBuilder):
 
         return features
 
+    def _get_config_value(self, key: str, default: Any = None) -> Any:
+        if hasattr(self._config, "get"):
+            return self._config.get(key, default)
+        return getattr(self._config, key, default)
+
+    def _sensor_enabled(self, name: str) -> bool:
+        sensor_cfg = self._get_config_value(name, [])
+        if isinstance(sensor_cfg, bool):
+            return sensor_cfg
+        return sensor_cfg is not None and len(sensor_cfg) > 0
+
+    def _active_cameras(self, cameras) -> List:
+        return [getattr(cameras, name) for name in self.CAMERA_ORDER if self._sensor_enabled(name)]
+
+    def _preprocess_camera_image(self, image: npt.NDArray[np.float32]) -> torch.Tensor:
+        im = Image.fromarray(image)
+        im = im.resize(self._config.image_size)
+        im = np.asarray(im, dtype=np.float32) / 255.0
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        im = (im - mean) / std
+        return torch.from_numpy(im).permute(2, 0, 1)
+
     def _get_camera_feature(self, agent_input: AgentInput) -> torch.Tensor:
         """
         Extract stitched camera from AgentInput
@@ -73,10 +98,7 @@ class DrivoRFeatureBuilder(AbstractFeatureBuilder):
 
         cameras = agent_input.cameras[-1]
 
-        # cameras = [cameras.cam_b0, cameras.cam_f0, cameras.cam_l0, cameras.cam_l1, cameras.cam_l2, cameras.cam_r0, cameras.cam_r1, cameras.cam_r2]
-
-        # this is a change for the focus front cam
-        cameras = [cameras.cam_f0, cameras.cam_b0, cameras.cam_l0, cameras.cam_l1, cameras.cam_l2, cameras.cam_r0, cameras.cam_r1, cameras.cam_r2]
+        cameras = self._active_cameras(cameras)
 
         images = []
         cam_Ks = []
@@ -102,17 +124,7 @@ class DrivoRFeatureBuilder(AbstractFeatureBuilder):
             cam_K[0, 2] = cam_K[0, 2] * self._config.image_size[0] / original_size[0]
             cam_K[1, 2] = cam_K[1, 2] * self._config.image_size[1] / original_size[1]
 
-            # image resize
-            im = im.resize(self._config.image_size)
-
-            # PIL to numpy and normalize
-            im = np.asarray(im, dtype=np.float32) / 255.0
-            mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-            std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-            im = (im - mean) / std
-
-            # convert to torch
-            im = torch.from_numpy(im).permute(2, 0, 1)
+            im = self._preprocess_camera_image(cam.image)
             cam_K = torch.from_numpy(cam_K)
             lidar2cam_rt = torch.from_numpy(lidar2cam_rt)
 
@@ -129,23 +141,26 @@ class DrivoRFeatureBuilder(AbstractFeatureBuilder):
 
         latent_cfg = getattr(self._config, "latent_learning", None)
         if latent_cfg is not None and latent_cfg.get("enabled", False):
+            image_next = torch.zeros_like(data["image"])
+            image_next_valid = False
+
             if agent_input.next_cameras is not None:
-                nc = agent_input.next_cameras
-                next_cam_list = [nc.cam_f0, nc.cam_b0, nc.cam_l0, nc.cam_l1,
-                                 nc.cam_l2, nc.cam_r0, nc.cam_r1, nc.cam_r2]
                 next_imgs = []
-                for cam in next_cam_list:
+                missing_next_camera = False
+                for cam in self._active_cameras(agent_input.next_cameras):
                     if cam.image is None:
-                        continue
-                    im = Image.fromarray(cam.image)
-                    im = im.resize(self._config.image_size)
-                    im = np.asarray(im, dtype=np.float32) / 255.0
-                    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-                    std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-                    im = (im - mean) / std
-                    next_imgs.append(torch.from_numpy(im).permute(2, 0, 1))
-                if next_imgs:
-                    data["image_next"] = torch.stack(next_imgs)  # (N_cams, C, H, W) — o_{t+1}
+                        missing_next_camera = True
+                        break
+                    next_imgs.append(self._preprocess_camera_image(cam.image))
+
+                if not missing_next_camera and next_imgs:
+                    image_next_candidate = torch.stack(next_imgs)
+                    if image_next_candidate.shape == data["image"].shape:
+                        image_next = image_next_candidate
+                        image_next_valid = True
+
+            data["image_next"] = image_next
+            data["image_next_valid"] = torch.tensor(image_next_valid, dtype=torch.bool)
 
         return data
 

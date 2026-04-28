@@ -28,6 +28,48 @@ def dump_feature_target_to_pickle(path: Path, data_dict: Dict[str, torch.Tensor]
         pickle.dump(data_dict, f)
 
 
+def _cached_bool(value) -> bool:
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return False
+        return bool(value.reshape(-1)[0].item())
+    return bool(value)
+
+
+def normalize_drivor_image_next(data_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Ensure DrivoR cached features always have collatable image_next fields."""
+    image = data_dict.get("image")
+    if not isinstance(image, torch.Tensor):
+        return data_dict
+
+    image_next = data_dict.get("image_next")
+    has_matching_image_next = isinstance(image_next, torch.Tensor) and image_next.shape == image.shape
+    image_next_valid = has_matching_image_next
+
+    if "image_next_valid" in data_dict:
+        image_next_valid = _cached_bool(data_dict["image_next_valid"]) and has_matching_image_next
+
+    if not has_matching_image_next:
+        image_next = torch.zeros_like(image)
+        image_next_valid = False
+
+    data_dict["image_next"] = image_next
+    data_dict["image_next_valid"] = torch.tensor(image_next_valid, dtype=torch.bool)
+    return data_dict
+
+
+def has_invalid_drivor_image_next(data_dict: Dict[str, torch.Tensor]) -> bool:
+    return "image_next_valid" in data_dict and not _cached_bool(data_dict["image_next_valid"])
+
+
+def builder_uses_latent_image_next(builder: AbstractFeatureBuilder) -> bool:
+    if builder.get_unique_name() != "drivor_feature":
+        return False
+    config = getattr(builder, "_config", None)
+    latent_cfg = config.get("latent_learning", None) if hasattr(config, "get") else getattr(config, "latent_learning", None)
+    return latent_cfg is not None and latent_cfg.get("enabled", False)
+
+
 class CacheOnlyDataset(torch.utils.data.Dataset):
     """Dataset wrapper for feature/target datasets from cache only."""
 
@@ -133,6 +175,8 @@ class CacheOnlyDataset(torch.utils.data.Dataset):
         for builder in self._feature_builders:
             data_dict_path = token_path / (builder.get_unique_name() + ".gz")
             data_dict = load_feature_target_from_pickle(data_dict_path)
+            if builder_uses_latent_image_next(builder):
+                data_dict = normalize_drivor_image_next(data_dict)
             features.update(data_dict)
 
         targets: Dict[str, torch.Tensor] = {}
@@ -165,6 +209,8 @@ class Dataset(torch.utils.data.Dataset):
             self._cache_path, feature_builders, target_builders
         )
         self.append_token_to_batch = append_token_to_batch
+        self.cached_token_count = 0
+        self.invalid_image_next_count = 0
         if self._cache_path is not None:
             self.cache_dataset()
 
@@ -209,9 +255,13 @@ class Dataset(torch.utils.data.Dataset):
         token_path = self._cache_path / metadata.log_name / metadata.initial_token
         os.makedirs(token_path, exist_ok=True)
 
+        invalid_image_next = False
         for builder in self._feature_builders:
             data_dict_path = token_path / (builder.get_unique_name() + ".gz")
             data_dict = builder.compute_features(agent_input)
+            if builder_uses_latent_image_next(builder):
+                data_dict = normalize_drivor_image_next(data_dict)
+                invalid_image_next = has_invalid_drivor_image_next(data_dict)
             dump_feature_target_to_pickle(data_dict_path, data_dict)
 
         for builder in self._target_builders:
@@ -220,6 +270,9 @@ class Dataset(torch.utils.data.Dataset):
             dump_feature_target_to_pickle(data_dict_path, data_dict)
 
         self._valid_cache_paths[token] = token_path
+        self.cached_token_count += 1
+        if invalid_image_next:
+            self.invalid_image_next_count += 1
 
     def _load_scene_with_token(self, token: str) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """
@@ -234,6 +287,8 @@ class Dataset(torch.utils.data.Dataset):
         for builder in self._feature_builders:
             data_dict_path = token_path / (builder.get_unique_name() + ".gz")
             data_dict = load_feature_target_from_pickle(data_dict_path)
+            if builder_uses_latent_image_next(builder):
+                data_dict = normalize_drivor_image_next(data_dict)
             features.update(data_dict)
 
         targets: Dict[str, torch.Tensor] = {}
@@ -249,6 +304,8 @@ class Dataset(torch.utils.data.Dataset):
 
         assert self._cache_path is not None, "Dataset did not receive a cache path!"
         os.makedirs(self._cache_path, exist_ok=True)
+        self.cached_token_count = 0
+        self.invalid_image_next_count = 0
 
         # determine tokens to cache
         if self._force_cache_computation:
@@ -266,6 +323,12 @@ class Dataset(torch.utils.data.Dataset):
 
         for token in tqdm(tokens_to_cache, desc="Caching Dataset"):
             self._cache_scene_with_token(token)
+
+        logger.info(
+            "Cached %d tokens; %d have invalid image_next.",
+            self.cached_token_count,
+            self.invalid_image_next_count,
+        )
 
     def __len__(self) -> None:
         """

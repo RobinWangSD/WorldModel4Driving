@@ -12,9 +12,11 @@ sys.path.insert(0, "/hugsim-storage/WorldModel4Driving/DrivoR_vanilla")
 
 # ─── helpers ────────────────────────────────────────────────────────────────
 
-def make_cameras(H=672, W=1148):
+def make_cameras(H=672, W=1148, missing=None):
     """Return a Cameras object with random numpy images for the 4 active cams."""
     from navsim.common.dataclasses import Camera, Cameras
+    missing = set(missing or [])
+
     def cam():
         return Camera(
             image=np.random.randint(0, 255, (H, W, 3), dtype=np.uint8),
@@ -23,13 +25,20 @@ def make_cameras(H=672, W=1148):
             intrinsics=np.array([[500,0,W/2],[0,500,H/2],[0,0,1]], dtype=np.float32),
             distortion=np.zeros(5, dtype=np.float32),
         )
+
+    def maybe_cam(name):
+        return Camera() if name in missing else cam()
+
     return Cameras(
-        cam_f0=cam(), cam_l0=cam(), cam_r0=cam(), cam_b0=cam(),
+        cam_f0=maybe_cam("cam_f0"),
+        cam_l0=maybe_cam("cam_l0"),
+        cam_r0=maybe_cam("cam_r0"),
+        cam_b0=maybe_cam("cam_b0"),
         cam_l1=Camera(), cam_l2=Camera(), cam_r1=Camera(), cam_r2=Camera(),
     )
 
 
-def make_agent_input(with_next=True):
+def make_agent_input(with_next=True, missing_next=None):
     from navsim.common.dataclasses import AgentInput, EgoStatus, Lidar
     ego = EgoStatus(
         ego_pose=np.zeros(3, dtype=np.float32),
@@ -41,12 +50,12 @@ def make_agent_input(with_next=True):
         ego_statuses=[ego] * 4,
         cameras=[make_cameras()] * 4,
         lidars=[Lidar()] * 4,
-        next_cameras=make_cameras() if with_next else None,
+        next_cameras=make_cameras(missing=missing_next) if with_next else None,
     )
     return agent_input
 
 
-def make_config(latent_enabled=True):
+def make_config(latent_enabled=True, one_step=True):
     cfg = OmegaConf.create({
         "b2d": False,
         "shared_refiner": False,
@@ -90,7 +99,7 @@ def make_config(latent_enabled=True):
         },
         "latent_learning": {
             "enabled": latent_enabled,
-            "one_step": True,
+            "one_step": one_step,
             "predictor": {"nhead": 2, "num_layers": 1, "d_ffn": 128},
             "loss_weights": {"prediction": 1.0},
             "stop_grad_target": True,
@@ -119,25 +128,46 @@ def test_feature_builder_image_next():
     agent_input = make_agent_input(with_next=True)
     features = builder.compute_features(agent_input)
     assert "image_next" in features, "image_next missing from features"
+    assert "image_next_valid" in features, "image_next_valid missing from features"
+    assert bool(features["image_next_valid"].item())
     assert features["image_next"].shape == features["image"].shape, \
         f"shape mismatch: image={features['image'].shape}, image_next={features['image_next'].shape}"
     print("OK")
 
 
 def test_feature_builder_no_image_next_on_eval():
-    print("  [3] DrivoRFeatureBuilder skips image_next when next_cameras is None (eval) ...", end=" ")
+    print("  [3] DrivoRFeatureBuilder writes invalid image_next placeholder when next_cameras is None ...", end=" ")
     from navsim.agents.drivoR.drivor_features import DrivoRFeatureBuilder
     cfg = make_config(latent_enabled=True)
     builder = DrivoRFeatureBuilder(cfg)
 
     agent_input = make_agent_input(with_next=False)
     features = builder.compute_features(agent_input)
-    assert "image_next" not in features, "image_next should not appear during eval"
+    assert "image_next" in features
+    assert "image_next_valid" in features
+    assert not bool(features["image_next_valid"].item())
+    assert features["image_next"].shape == features["image"].shape
+    assert torch.count_nonzero(features["image_next"]).item() == 0
+    print("OK")
+
+
+def test_feature_builder_partial_image_next_invalid():
+    print("  [4] DrivoRFeatureBuilder invalidates image_next when one future camera is missing ...", end=" ")
+    from navsim.agents.drivoR.drivor_features import DrivoRFeatureBuilder
+    cfg = make_config(latent_enabled=True)
+    builder = DrivoRFeatureBuilder(cfg)
+
+    agent_input = make_agent_input(with_next=True, missing_next=["cam_r0"])
+    features = builder.compute_features(agent_input)
+    assert "image_next" in features
+    assert not bool(features["image_next_valid"].item())
+    assert features["image_next"].shape == features["image"].shape
+    assert torch.count_nonzero(features["image_next"]).item() == 0
     print("OK")
 
 
 def test_latent_predictor():
-    print("  [4] LatentPredictor forward shape ...", end=" ")
+    print("  [5] LatentPredictor forward shape ...", end=" ")
     from navsim.agents.drivoR.layers.latent_predictor import LatentPredictor
     B, N, D = 2, 16, 64
     predictor = LatentPredictor(d_model=D, nhead=2, num_layers=1, d_ffn=128, ego_dim=11)
@@ -149,7 +179,7 @@ def test_latent_predictor():
 
 
 def test_latent_loss():
-    print("  [5] LatentLoss forward, stop_grad_target=True ...", end=" ")
+    print("  [6] LatentLoss forward, stop_grad_target=True ...", end=" ")
     from navsim.agents.drivoR.layers.losses.latent_loss import LatentLoss
     B, T, N, D = 2, 1, 16, 64
     loss_fn = LatentLoss(prediction_weight=1.0, stop_grad_target=True)
@@ -166,7 +196,7 @@ def test_latent_loss():
 
 
 def test_model_forward_train_latent():
-    print("  [6] DrivoRModel forward (train, with latent) — shapes and latent_loss_dict ...", end=" ")
+    print("  [7] DrivoRModel forward (train, with latent) — shapes and latent_loss_dict ...", end=" ")
     from navsim.agents.drivoR.drivor_model import DrivoRModel
     cfg = make_config(latent_enabled=True)
     model = DrivoRModel(cfg)
@@ -194,8 +224,70 @@ def test_model_forward_train_latent():
     print("OK")
 
 
+def test_model_forward_train_latent_all_invalid_zero():
+    print("  [8] DrivoRModel forward (train, invalid image_next) — zero latent loss ...", end=" ")
+    from navsim.agents.drivoR.drivor_model import DrivoRModel
+    cfg = make_config(latent_enabled=True)
+    model = DrivoRModel(cfg)
+    model.train()
+
+    B = 2
+    N_cams = 4
+    image = torch.randn(B, N_cams, 3, 56, 56)
+    features = {
+        "image": image,
+        "image_next": torch.zeros_like(image),
+        "image_next_valid": torch.zeros(B, dtype=torch.bool),
+        "ego_status": torch.randn(B, 4, 11),
+    }
+
+    with torch.no_grad():
+        output = model(features)
+
+    assert "latent_loss_dict" in output
+    assert output["latent_loss_dict"]["loss"].item() == 0
+    assert output["latent_loss_dict"]["latent_prediction"].item() == 0
+    print("OK")
+
+
+def test_model_forward_train_latent_mixed_valid():
+    print("  [9] DrivoRModel forward (train, mixed image_next validity) — masks invalid rows ...", end=" ")
+    from navsim.agents.drivoR.drivor_model import DrivoRModel
+    cfg = make_config(latent_enabled=True)
+    model = DrivoRModel(cfg)
+    model.train()
+
+    B = 2
+    N_cams = 4
+    features = {
+        "image": torch.randn(B, N_cams, 3, 56, 56),
+        "image_next": torch.randn(B, N_cams, 3, 56, 56),
+        "image_next_valid": torch.tensor([True, False]),
+        "ego_status": torch.randn(B, 4, 11),
+    }
+
+    captured = {}
+    orig = model._compute_latent_loss
+
+    def patched(features, cur_tokens, next_tokens, valid_mask=None):
+        captured["valid_rows"] = cur_tokens.shape[0]
+        captured["valid_mask"] = valid_mask.detach().cpu()
+        return orig(features, cur_tokens, next_tokens, valid_mask)
+
+    model._compute_latent_loss = patched
+
+    with torch.no_grad():
+        output = model(features)
+
+    assert "latent_loss_dict" in output
+    assert output["latent_loss_dict"]["loss"].shape == ()
+    assert captured["valid_rows"] == 1
+    assert torch.equal(captured["valid_mask"], torch.tensor([True, False]))
+    print("OK")
+
+
 def test_model_forward_eval_no_latent():
-    print("  [7] DrivoRModel forward (eval, no image_next) — no latent_loss_dict ...", end=" ")
+    print(" [10] DrivoRModel forward (eval, no image_next) — no latent_loss_dict ...", end=" ")
     from navsim.agents.drivoR.drivor_model import DrivoRModel
     cfg = make_config(latent_enabled=True)
     model = DrivoRModel(cfg)
@@ -218,7 +310,7 @@ def test_model_forward_eval_no_latent():
 
 
 def test_model_forward_latent_disabled():
-    print("  [8] DrivoRModel forward (latent disabled in config) — no latent_loss_dict ...", end=" ")
+    print(" [11] DrivoRModel forward (latent disabled in config) — no latent_loss_dict ...", end=" ")
     from navsim.agents.drivoR.drivor_model import DrivoRModel
     cfg = make_config(latent_enabled=False)
     model = DrivoRModel(cfg)
@@ -239,8 +331,23 @@ def test_model_forward_latent_disabled():
     print("OK")
 
 
+def test_model_init_one_step_false_not_implemented():
+    print(" [12] DrivoRModel init raises when latent one_step=False ...", end=" ")
+    from navsim.agents.drivoR.drivor_model import DrivoRModel
+    cfg = make_config(latent_enabled=True, one_step=False)
+
+    try:
+        DrivoRModel(cfg)
+    except NotImplementedError as e:
+        assert "one_step=False" in str(e)
+        print("OK")
+        return
+
+    raise AssertionError("DrivoRModel should raise NotImplementedError for latent one_step=False")
+
+
 def test_policy_and_predictor_share_tokens():
-    print("  [9] Policy scene tokens == latent predictor cur_tokens (same tensor path) ...", end=" ")
+    print(" [13] Policy scene tokens == latent predictor cur_tokens (same tensor path) ...", end=" ")
     from navsim.agents.drivoR.drivor_model import DrivoRModel
     cfg = make_config(latent_enabled=True)
     model = DrivoRModel(cfg)
@@ -254,9 +361,9 @@ def test_policy_and_predictor_share_tokens():
     # Patch _compute_latent_loss to capture cur_tokens
     captured = {}
     orig = model._compute_latent_loss
-    def patched(features, cur_tokens, next_tokens):
+    def patched(features, cur_tokens, next_tokens, valid_mask=None):
         captured["cur_tokens"] = cur_tokens
-        return orig(features, cur_tokens, next_tokens)
+        return orig(features, cur_tokens, next_tokens, valid_mask)
     model._compute_latent_loss = patched
 
     with torch.no_grad():
@@ -273,7 +380,7 @@ def test_policy_and_predictor_share_tokens():
 
 
 def test_drivor_loss_latent_keys():
-    print(" [10] DrivoRLoss: latent_weight stored and loss_dict gets latent keys ...", end=" ")
+    print(" [14] DrivoRLoss: latent_weight stored and loss_dict gets latent keys ...", end=" ")
     from navsim.agents.drivoR.layers.losses.drivor_loss import DrivoRLoss
 
     # Verify latent_weight is stored correctly
@@ -306,6 +413,32 @@ def test_drivor_loss_latent_keys():
     print("OK")
 
 
+def test_cache_normalizes_legacy_image_next():
+    print(" [15] Cache normalization handles missing, partial, and legacy image_next ...", end=" ")
+    from navsim.planning.training.dataset import normalize_drivor_image_next
+
+    image = torch.randn(4, 3, 56, 56)
+
+    missing = normalize_drivor_image_next({"image": image.clone()})
+    assert missing["image_next"].shape == image.shape
+    assert not bool(missing["image_next_valid"].item())
+    assert torch.count_nonzero(missing["image_next"]).item() == 0
+
+    partial = normalize_drivor_image_next({
+        "image": image.clone(),
+        "image_next": torch.randn(3, 3, 56, 56),
+    })
+    assert partial["image_next"].shape == image.shape
+    assert not bool(partial["image_next_valid"].item())
+
+    legacy = normalize_drivor_image_next({
+        "image": image.clone(),
+        "image_next": torch.randn_like(image),
+    })
+    assert bool(legacy["image_next_valid"].item())
+    print("OK")
+
+
 # ─── main ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -314,13 +447,18 @@ if __name__ == "__main__":
         test_agent_input_next_cameras,
         test_feature_builder_image_next,
         test_feature_builder_no_image_next_on_eval,
+        test_feature_builder_partial_image_next_invalid,
         test_latent_predictor,
         test_latent_loss,
         test_model_forward_train_latent,
+        test_model_forward_train_latent_all_invalid_zero,
+        test_model_forward_train_latent_mixed_valid,
         test_model_forward_eval_no_latent,
         test_model_forward_latent_disabled,
+        test_model_init_one_step_false_not_implemented,
         test_policy_and_predictor_share_tokens,
         test_drivor_loss_latent_keys,
+        test_cache_normalizes_legacy_image_next,
     ]
     failed = []
     for t in tests:

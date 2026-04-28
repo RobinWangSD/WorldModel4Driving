@@ -55,7 +55,29 @@ def cache_features(args: List[Dict[str, Union[List[str], DictConfig]]]) -> List[
         cache_path=cfg.cache_path,
         force_cache_computation=cfg.force_cache_computation,
     )
-    return []
+    logger.info(
+        "Cached %d scenarios for thread_id=%s, node_id=%d; invalid image_next=%d.",
+        dataset.cached_token_count,
+        thread_id,
+        node_id,
+        dataset.invalid_image_next_count,
+    )
+    return [
+        {
+            "cached": dataset.cached_token_count,
+            "invalid_image_next": dataset.invalid_image_next_count,
+        }
+    ]
+
+
+def _flatten_cache_results(results: List[Any]) -> List[Dict[str, int]]:
+    flat_results: List[Dict[str, int]] = []
+    for result in results:
+        if isinstance(result, dict):
+            flat_results.append(result)
+        elif isinstance(result, list):
+            flat_results.extend(item for item in result if isinstance(item, dict))
+    return flat_results
 
 
 @hydra.main(config_path=CONFIG_PATH, config_name=CONFIG_NAME, version_base=None)
@@ -91,8 +113,16 @@ def main(cfg: DictConfig) -> None:
         for log_file, tokens_list in scene_loader.get_tokens_list_per_log().items()
     ]
 
-    _ =worker_map(worker, cache_features, data_points)#cache_features(data_points)#
-    logger.info(f"Finished caching {len(scene_loader)} scenarios for training/validation dataset")
+    cache_results = worker_map(worker, cache_features, data_points)#cache_features(data_points)#
+    flat_cache_results = _flatten_cache_results(cache_results)
+    cached_count = sum(result["cached"] for result in flat_cache_results)
+    invalid_image_next_count = sum(result["invalid_image_next"] for result in flat_cache_results)
+    logger.info(
+        "Finished caching %d scenarios for training/validation dataset; newly cached=%d, invalid image_next=%d.",
+        len(scene_loader),
+        cached_count,
+        invalid_image_next_count,
+    )
 
 
 if __name__ == "__main__":

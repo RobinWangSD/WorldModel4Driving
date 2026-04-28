@@ -20,6 +20,16 @@ class DrivoRModel(nn.Module):
         self.poses_num=config.num_poses
         self.state_size=3
         self.embed_dims = self._config.tf_d_model
+        latent_cfg = config.get("latent_learning", None)
+        self.use_latent = latent_cfg is not None and latent_cfg.get("enabled", False)
+        self.one_step = True
+        if self.use_latent:
+            self.one_step = latent_cfg.get("one_step", True)
+            if not self.one_step:
+                raise NotImplementedError(
+                    "latent_learning.one_step=False is reserved for future history latent learning "
+                    "and is not implemented yet."
+                )
 
         ###########################################
         # camera embedding
@@ -106,10 +116,7 @@ class DrivoRModel(nn.Module):
         self.b2d=config.b2d
 
         # Latent space learning (optional)
-        latent_cfg = config.get("latent_learning", None)
-        self.use_latent = latent_cfg is not None and latent_cfg.get("enabled", False)
         if self.use_latent:
-            self.one_step = latent_cfg.get("one_step", True)
             pred_cfg = latent_cfg.get("predictor", {})
             self.latent_predictor = LatentPredictor(
                 d_model=config.tf_d_model,
@@ -145,7 +152,9 @@ class DrivoRModel(nn.Module):
 
         scene_features = []
         next_tokens = None
-        want_latent = self.use_latent and self.training and "image_next" in features
+        latent_valid_mask = None
+        has_valid_latent = False
+        want_latent = self.use_latent and self.training and self.one_step and self.num_cams > 0
         # image features
         if self.num_cams > 0:
             if "image" in features:
@@ -155,10 +164,13 @@ class DrivoRModel(nn.Module):
             else:
                 raise ValueError
 
-            if want_latent and self.one_step:
-                # Encode o_t and o_{t+1} in one backbone call.
-                img_next = features["image_next"]
-                img_pair = torch.cat([img, img_next], dim=0)
+            if want_latent:
+                img_next, latent_valid_mask = self._get_valid_image_next(features, img)
+                has_valid_latent = img_next is not None and bool(latent_valid_mask.any().item())
+
+            if has_valid_latent:
+                # Encode all current frames and only valid next frames in one backbone call.
+                img_pair = torch.cat([img, img_next[latent_valid_mask]], dim=0)
                 scene_tokens = self.scene_embeds.repeat(img_pair.shape[0], 1, 1, 1)
                 pair_tokens = self.image_backbone(img_pair, scene_tokens)
                 image_scene_tokens = pair_tokens[:batch_size]   # o_t → policy + predictor input
@@ -184,7 +196,15 @@ class DrivoRModel(nn.Module):
         # Latent transition model: p(o_{t+1} | o_t, a_t)
         latent_loss_dict = None
         if want_latent:
-            latent_loss_dict = self._compute_latent_loss(features, image_scene_tokens, next_tokens)
+            if has_valid_latent:
+                latent_loss_dict = self._compute_latent_loss(
+                    features,
+                    image_scene_tokens[latent_valid_mask],
+                    next_tokens,
+                    latent_valid_mask,
+                )
+            else:
+                latent_loss_dict = self._zero_latent_loss(image_scene_tokens)
 
         # initial trajectories
         proposals = self.traj_head[0](traj_tokens).reshape(traj_tokens.shape[0], -1, self.poses_num, self.state_size)
@@ -243,12 +263,44 @@ class DrivoRModel(nn.Module):
 
         return output
 
-    def _compute_latent_loss(self, features, cur_tokens, next_tokens):
+    def _get_valid_image_next(self, features, img):
+        batch_size = img.shape[0]
+        invalid_mask = torch.zeros(batch_size, dtype=torch.bool, device=img.device)
+        img_next = features.get("image_next", None)
+        if not isinstance(img_next, torch.Tensor) or img_next.shape != img.shape:
+            return None, invalid_mask
+        img_next = img_next.to(device=img.device, dtype=img.dtype)
+
+        valid_mask = features.get("image_next_valid", None)
+        if valid_mask is None:
+            valid_mask = torch.ones(batch_size, dtype=torch.bool, device=img.device)
+        elif isinstance(valid_mask, torch.Tensor):
+            valid_mask = valid_mask.to(device=img.device, dtype=torch.bool).reshape(-1)
+            if valid_mask.numel() == 1 and batch_size != 1:
+                valid_mask = valid_mask.expand(batch_size)
+            elif valid_mask.numel() != batch_size:
+                valid_mask = invalid_mask
+        else:
+            valid_mask = torch.as_tensor(valid_mask, dtype=torch.bool, device=img.device).reshape(-1)
+            if valid_mask.numel() == 1 and batch_size != 1:
+                valid_mask = valid_mask.expand(batch_size)
+            elif valid_mask.numel() != batch_size:
+                valid_mask = invalid_mask
+
+        return img_next, valid_mask
+
+    def _zero_latent_loss(self, reference):
+        zero = reference.new_zeros(())
+        return {
+            "loss": zero,
+            "latent_prediction": zero,
+        }
+
+    def _compute_latent_loss(self, features, cur_tokens, next_tokens, valid_mask=None):
         """p(o_{t+1} | o_t, a_t): predict next-frame tokens from current scene tokens."""
         ego_status = features["ego_status"]
+        if valid_mask is not None:
+            ego_status = ego_status[valid_mask]
         ego_t = ego_status[:, -1] if ego_status.dim() == 3 else ego_status
         predicted = self.latent_predictor(cur_tokens, ego_t)
         return self.latent_loss_fn(predicted.unsqueeze(1), next_tokens.unsqueeze(1))
-
-
-
