@@ -1,5 +1,6 @@
 from time import sleep
 
+import logging
 import numpy as np
 import pytorch_lightning as pl
 import torch
@@ -8,6 +9,8 @@ from typing import Dict, Tuple, Any, List
 from navsim.common.dataclasses import Trajectory
 from navsim.agents.abstract_agent import AbstractAgent
 from navsim.common.dataclasses import Trajectory
+
+logger = logging.getLogger(__name__)
 
 def _rowwise_isin(tensor_1: torch.Tensor, target_tensor: torch.Tensor) -> torch.Tensor:
     matches = (tensor_1[:, None] == target_tensor)
@@ -27,6 +30,34 @@ class AgentLightningModule(pl.LightningModule):
         self.agent = agent
         self.checkpoint_file=None
         self.for_viz = for_viz
+        self._logged_first_train_batch = False
+
+    def _rank_zero_print(self, message: str) -> None:
+        if getattr(self, "global_rank", 0) == 0:
+            logger.info(message)
+            print(message, flush=True)
+
+    def _log_first_train_batch_latent_state(self, features: Dict[str, Tensor], loss_dict: Any = None) -> None:
+        has_image_next = "image_next" in features
+        has_image_next_valid = "image_next_valid" in features
+        message_parts = [
+            "[DrivoR Latent First Train Batch]",
+            f"has_image_next={has_image_next}",
+            f"has_image_next_valid={has_image_next_valid}",
+        ]
+
+        valid_mask = features.get("image_next_valid", None)
+        if isinstance(valid_mask, torch.Tensor):
+            valid_mask = valid_mask.reshape(-1).to(dtype=torch.bool)
+            message_parts.append(f"image_next_valid_count={int(valid_mask.sum().item())}/{valid_mask.numel()}")
+        else:
+            message_parts.append("image_next_valid_count=missing")
+
+        if isinstance(loss_dict, dict):
+            message_parts.append(f"has_latent_loss={'latent_loss' in loss_dict}")
+            message_parts.append(f"has_latent_prediction={'latent_prediction' in loss_dict}")
+
+        self._rank_zero_print(", ".join(message_parts))
 
     def _step(self, batch: Tuple[Dict[str, Tensor], Dict[str, Tensor]], logging_prefix: str) -> Tensor:
         """
@@ -39,6 +70,10 @@ class AgentLightningModule(pl.LightningModule):
 
         prediction = self.agent.forward(features)
         loss_dict = self.agent.compute_loss(features, targets, prediction)
+
+        if logging_prefix == "train" and not self._logged_first_train_batch:
+            self._log_first_train_batch_latent_state(features, loss_dict)
+            self._logged_first_train_batch = True
 
         if type(loss_dict) is dict:
             for key,value in loss_dict.items():

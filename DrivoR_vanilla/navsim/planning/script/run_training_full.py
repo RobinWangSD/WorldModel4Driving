@@ -27,6 +27,35 @@ logger = logging.getLogger(__name__)
 CONFIG_PATH = "config/training"
 CONFIG_NAME = "default_training"
 
+def log_and_print(message: str) -> None:
+    logger.info(message)
+    print(message, flush=True)
+
+
+def log_training_configuration(cfg: DictConfig) -> None:
+    cache_message = (
+        "[DrivoR Training Config] "
+        f"cache_path={cfg.cache_path}, "
+        f"use_cache_without_dataset={cfg.use_cache_without_dataset}, "
+        f"force_cache_computation={cfg.force_cache_computation}"
+    )
+    log_and_print(cache_message)
+
+    agent_cfg = cfg.agent.get("config", {})
+    latent_cfg = agent_cfg.get("latent_learning", {})
+    predictor_cfg = latent_cfg.get("predictor", {})
+    loss_cfg = cfg.agent.get("loss", {})
+    latent_message = (
+        "[DrivoR Latent Config] "
+        f"enabled={latent_cfg.get('enabled', False)}, "
+        f"one_step={latent_cfg.get('one_step', True)}, "
+        f"predictor={dict(predictor_cfg)}, "
+        f"latent_weight={loss_cfg.get('latent_weight', None)}, "
+        f"stop_grad_target={latent_cfg.get('stop_grad_target', True)}"
+    )
+    log_and_print(latent_message)
+
+
 def dist_ready():
     return dist.is_available() and dist.is_initialized()
 
@@ -103,6 +132,7 @@ def main(cfg: DictConfig) -> None:
     logger.info(f"Global Seed set to {cfg.seed}")
 
     logger.info(f"Path where all results are stored: {cfg.output_dir}")
+    log_training_configuration(cfg)
 
     logger.info("Building Agent")
     agent: AbstractAgent = instantiate(cfg.agent)
@@ -113,7 +143,10 @@ def main(cfg: DictConfig) -> None:
     )
 
     if cfg.use_cache_without_dataset:
-        logger.info("Using cached data without building SceneLoader")
+        log_and_print(
+            "[DrivoR Cache] Using CacheOnlyDataset; SceneLoader is bypassed. "
+            f"cache_path={cfg.cache_path}"
+        )
         assert (
             not cfg.force_cache_computation
         ), "force_cache_computation must be False when using cached data without building SceneLoader"
@@ -132,9 +165,17 @@ def main(cfg: DictConfig) -> None:
             target_builders=agent.get_target_builders(),
             log_names=cfg.val_logs,
         )
+        log_and_print(
+            "[DrivoR Cache] CacheOnlyDataset sample counts: "
+            f"train={len(train_data)}, val={len(val_data)}, cache_path={cfg.cache_path}"
+        )
     else:
         logger.info("Building SceneLoader")
         train_data, val_data = build_datasets(cfg, agent)
+        log_and_print(
+            "[DrivoR Cache] Dataset sample counts: "
+            f"train={len(train_data)}, val={len(val_data)}, cache_path={cfg.cache_path}"
+        )
 
     logger.info("Building Datasets")
     train_dataloader = DataLoader(train_data, **cfg.dataloader.params, shuffle=True,drop_last=True)
