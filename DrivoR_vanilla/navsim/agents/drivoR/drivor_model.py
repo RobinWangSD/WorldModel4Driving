@@ -169,12 +169,16 @@ class DrivoRModel(nn.Module):
                 has_valid_latent = img_next is not None and bool(latent_valid_mask.any().item())
 
             if has_valid_latent:
-                # Encode all current frames and only valid next frames in one backbone call.
-                img_pair = torch.cat([img, img_next[latent_valid_mask]], dim=0)
-                scene_tokens = self.scene_embeds.repeat(img_pair.shape[0], 1, 1, 1)
-                pair_tokens = self.image_backbone(img_pair, scene_tokens)
-                image_scene_tokens = pair_tokens[:batch_size]   # o_t → policy + predictor input
-                next_tokens = pair_tokens[batch_size:]           # o_{t+1} → latent target
+                scene_tokens = self.scene_embeds.repeat(batch_size, 1, 1, 1)
+                image_scene_tokens = self.image_backbone(img, scene_tokens)
+
+                valid_img_next = img_next[latent_valid_mask]
+                next_scene_tokens = self.scene_embeds.repeat(valid_img_next.shape[0], 1, 1, 1)
+                if self.latent_loss_fn.stop_grad_target:
+                    with torch.no_grad():
+                        next_tokens = self.image_backbone(valid_img_next, next_scene_tokens)
+                else:
+                    next_tokens = self.image_backbone(valid_img_next, next_scene_tokens)
             else:
                 scene_tokens = self.scene_embeds.repeat(batch_size, 1, 1, 1)
                 image_scene_tokens = self.image_backbone(img, scene_tokens)
