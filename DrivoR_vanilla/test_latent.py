@@ -218,6 +218,13 @@ def test_latent_loss():
     assert predicted.grad is not None
     # target should have no grad (stop_grad=True)
     assert target.grad is None
+
+    predicted_masked = torch.randn(B, T, N, D, requires_grad=True)
+    target_masked = torch.randn(B, T, N, D)
+    masked = loss_fn(predicted_masked, target_masked, valid_mask=torch.zeros(B, dtype=torch.bool))
+    assert masked["loss"].item() == 0
+    masked["loss"].backward()
+    assert predicted_masked.grad is not None
     print("OK")
 
 
@@ -251,7 +258,7 @@ def test_model_forward_train_latent():
 
 
 def test_model_forward_train_latent_all_invalid_zero():
-    print(" [10] DrivoRModel forward (train, invalid image_next) — zero latent loss ...", end=" ")
+    print(" [10] DrivoRModel forward/backward (train, invalid image_next) — zero latent loss with predictor grads ...", end=" ")
     from navsim.agents.drivoR.drivor_model import DrivoRModel
     cfg = make_config(latent_enabled=True)
     model = DrivoRModel(cfg)
@@ -267,17 +274,20 @@ def test_model_forward_train_latent_all_invalid_zero():
         "ego_status": torch.randn(B, 4, 11),
     }
 
-    with torch.no_grad():
-        output = model(features)
+    output = model(features)
 
     assert "latent_loss_dict" in output
     assert output["latent_loss_dict"]["loss"].item() == 0
     assert output["latent_loss_dict"]["latent_prediction"].item() == 0
+    assert output["latent_loss_dict"]["loss"].requires_grad
+    output["latent_loss_dict"]["loss"].backward()
+    predictor_grads = [p.grad for p in model.latent_predictor.parameters() if p.requires_grad]
+    assert predictor_grads and all(g is not None for g in predictor_grads)
     print("OK")
 
 
 def test_model_forward_train_latent_mixed_valid():
-    print(" [11] DrivoRModel forward (train, mixed image_next validity) — masks invalid rows ...", end=" ")
+    print(" [11] DrivoRModel forward (train, mixed image_next validity) — masks loss rows ...", end=" ")
     from navsim.agents.drivoR.drivor_model import DrivoRModel
     cfg = make_config(latent_enabled=True)
     model = DrivoRModel(cfg)
@@ -296,7 +306,7 @@ def test_model_forward_train_latent_mixed_valid():
     orig = model._compute_latent_loss
 
     def patched(features, cur_tokens, next_tokens, valid_mask=None):
-        captured["valid_rows"] = cur_tokens.shape[0]
+        captured["batch_rows"] = cur_tokens.shape[0]
         captured["valid_mask"] = valid_mask.detach().cpu()
         return orig(features, cur_tokens, next_tokens, valid_mask)
 
@@ -307,7 +317,7 @@ def test_model_forward_train_latent_mixed_valid():
 
     assert "latent_loss_dict" in output
     assert output["latent_loss_dict"]["loss"].shape == ()
-    assert captured["valid_rows"] == 1
+    assert captured["batch_rows"] == B
     assert torch.equal(captured["valid_mask"], torch.tensor([True, False]))
     print("OK")
 

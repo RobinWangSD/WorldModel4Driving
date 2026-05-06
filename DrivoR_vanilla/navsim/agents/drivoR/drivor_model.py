@@ -153,7 +153,6 @@ class DrivoRModel(nn.Module):
         scene_features = []
         next_tokens = None
         latent_valid_mask = None
-        has_valid_latent = False
         want_latent = self.use_latent and self.training and self.one_step and self.num_cams > 0
         # image features
         if self.num_cams > 0:
@@ -166,22 +165,17 @@ class DrivoRModel(nn.Module):
 
             if want_latent:
                 img_next, latent_valid_mask = self._get_valid_image_next(features, img)
-                has_valid_latent = img_next is not None and bool(latent_valid_mask.any().item())
 
-            if has_valid_latent:
-                scene_tokens = self.scene_embeds.repeat(batch_size, 1, 1, 1)
-                image_scene_tokens = self.image_backbone(img, scene_tokens)
+            scene_tokens = self.scene_embeds.repeat(batch_size, 1, 1, 1)
+            image_scene_tokens = self.image_backbone(img, scene_tokens)
 
-                valid_img_next = img_next[latent_valid_mask]
-                next_scene_tokens = self.scene_embeds.repeat(valid_img_next.shape[0], 1, 1, 1)
+            if want_latent:
+                next_scene_tokens = self.scene_embeds.repeat(batch_size, 1, 1, 1)
                 if self.latent_loss_fn.stop_grad_target:
                     with torch.no_grad():
-                        next_tokens = self.image_backbone(valid_img_next, next_scene_tokens)
+                        next_tokens = self.image_backbone(img_next, next_scene_tokens)
                 else:
-                    next_tokens = self.image_backbone(valid_img_next, next_scene_tokens)
-            else:
-                scene_tokens = self.scene_embeds.repeat(batch_size, 1, 1, 1)
-                image_scene_tokens = self.image_backbone(img, scene_tokens)
+                    next_tokens = self.image_backbone(img_next, next_scene_tokens)
 
             log.debug(f"Backbone image - {image_scene_tokens.shape}")
             scene_features.append(image_scene_tokens)
@@ -200,15 +194,12 @@ class DrivoRModel(nn.Module):
         # Latent transition model: p(o_{t+1} | o_t, a_t)
         latent_loss_dict = None
         if want_latent:
-            if has_valid_latent:
-                latent_loss_dict = self._compute_latent_loss(
-                    features,
-                    image_scene_tokens[latent_valid_mask],
-                    next_tokens,
-                    latent_valid_mask,
-                )
-            else:
-                latent_loss_dict = self._zero_latent_loss(image_scene_tokens)
+            latent_loss_dict = self._compute_latent_loss(
+                features,
+                image_scene_tokens,
+                next_tokens,
+                latent_valid_mask,
+            )
 
         # initial trajectories
         proposals = self.traj_head[0](traj_tokens).reshape(traj_tokens.shape[0], -1, self.poses_num, self.state_size)
@@ -272,7 +263,7 @@ class DrivoRModel(nn.Module):
         invalid_mask = torch.zeros(batch_size, dtype=torch.bool, device=img.device)
         img_next = features.get("image_next", None)
         if not isinstance(img_next, torch.Tensor) or img_next.shape != img.shape:
-            return None, invalid_mask
+            return torch.zeros_like(img), invalid_mask
         img_next = img_next.to(device=img.device, dtype=img.dtype)
 
         valid_mask = features.get("image_next_valid", None)
@@ -293,18 +284,9 @@ class DrivoRModel(nn.Module):
 
         return img_next, valid_mask
 
-    def _zero_latent_loss(self, reference):
-        zero = reference.new_zeros(())
-        return {
-            "loss": zero,
-            "latent_prediction": zero,
-        }
-
     def _compute_latent_loss(self, features, cur_tokens, next_tokens, valid_mask=None):
         """p(o_{t+1} | o_t, a_t): predict next-frame tokens from current scene tokens."""
         ego_status = features["ego_status"]
-        if valid_mask is not None:
-            ego_status = ego_status[valid_mask]
         ego_t = ego_status[:, -1] if ego_status.dim() == 3 else ego_status
         predicted = self.latent_predictor(cur_tokens, ego_t)
-        return self.latent_loss_fn(predicted.unsqueeze(1), next_tokens.unsqueeze(1))
+        return self.latent_loss_fn(predicted.unsqueeze(1), next_tokens.unsqueeze(1), valid_mask=valid_mask)

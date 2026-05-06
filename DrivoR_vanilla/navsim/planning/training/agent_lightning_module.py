@@ -55,7 +55,7 @@ class AgentLightningModule(pl.LightningModule):
 
         if isinstance(loss_dict, dict):
             message_parts.append(f"has_latent_loss={'latent_loss' in loss_dict}")
-            message_parts.append(f"has_latent_prediction={'latent_prediction' in loss_dict}")
+            message_parts.append(f"has_latent_prediction={'latent_latent_prediction' in loss_dict}")
 
         self._rank_zero_print(", ".join(message_parts))
 
