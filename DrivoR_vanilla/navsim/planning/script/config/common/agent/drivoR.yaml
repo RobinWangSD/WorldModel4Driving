@@ -103,6 +103,9 @@ config:
       d_ffn: 512
     loss_weights:
       prediction: 1.0
+      sigreg: 0.0
+    sigreg_knots: 17
+    sigreg_num_proj: 1024
     stop_grad_target: true
 
 

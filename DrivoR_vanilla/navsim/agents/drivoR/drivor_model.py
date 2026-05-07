@@ -129,6 +129,9 @@ class DrivoRModel(nn.Module):
             self.latent_loss_fn = LatentLoss(
                 prediction_weight=loss_w.get("prediction", 1.0),
                 stop_grad_target=latent_cfg.get("stop_grad_target", True),
+                sigreg_weight=loss_w.get("sigreg", 0.0),
+                sigreg_knots=latent_cfg.get("sigreg_knots", 17),
+                sigreg_num_proj=latent_cfg.get("sigreg_num_proj", 1024),
             )
 
 
