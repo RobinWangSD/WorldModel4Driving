@@ -17,6 +17,19 @@ config:
 
   long_trajectory_additional_poses: -1 # to load additional poses (not use currently in this version)
 
+  ####################
+  # temporal caching & multi-mode training (new)
+  # When temporal_caching.enabled=false, all of this is a no-op and the agent
+  # behaves bit-identically to the legacy single-step setup.
+  temporal_caching:
+    enabled: false
+    history_iters: [0, 1, 2, 3]
+    future_iters:  [4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+    active_cameras: [cam_f0]
+  input_mode: current_image           # current_image | history_images
+  predict_future_latent: false
+  latent_pred_steps: 10               # 1..len(future_iters); used when predict_future_latent=true
+
   noc: 1.0 
   dac: 1.0
   ddc: 0.0

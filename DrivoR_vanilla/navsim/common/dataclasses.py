@@ -152,6 +152,8 @@ class AgentInput:
     cameras: List[Cameras]
     lidars: List[Lidar]
     next_cameras: Optional[Cameras] = None  # o_{t+1}, set during training when future frames are available
+    future_cameras: Optional[List[Cameras]] = None  # multi-step future cameras (temporal caching)
+    future_ego_statuses: Optional[List[EgoStatus]] = None  # multi-step future ego state (temporal caching)
 
     @classmethod
     def from_scene_dict_list(
@@ -372,9 +374,12 @@ class Scene:
             ),
         )
 
-    def get_agent_input(self) -> AgentInput:
+    def get_agent_input(self, expose_future: bool = False) -> AgentInput:
         """
         Extracts agents input dataclass (without privileged information) from scene.
+        :param expose_future: if True, populate AgentInput.future_cameras and
+            future_ego_statuses with the post-history frames in local coordinates.
+            Default False preserves legacy behavior.
         :return: agent input dataclass
         """
 
@@ -400,6 +405,40 @@ class Scene:
         agent_input = AgentInput(ego_statuses, cameras, lidars)
         if len(self.frames) > self.scene_metadata.num_history_frames:
             agent_input.next_cameras = self.frames[self.scene_metadata.num_history_frames].cameras
+
+        if expose_future:
+            num_hist = self.scene_metadata.num_history_frames
+            num_fut = self.scene_metadata.num_future_frames
+            num_fut_available = min(num_fut, max(0, len(self.frames) - num_hist))
+
+            if num_fut_available > 0:
+                # Build local-frame poses for the future window using the current
+                # frame (= last history frame) as the origin, matching the convention
+                # used in get_future_trajectory and the history trajectory.
+                origin = StateSE2(*self.frames[num_hist - 1].ego_status.ego_pose)
+                future_global_poses = np.array(
+                    [self.frames[num_hist + i].ego_status.ego_pose for i in range(num_fut_available)],
+                    dtype=np.float64,
+                )
+                future_local_poses = convert_absolute_to_relative_se2_array(origin, future_global_poses)
+
+                future_ego_statuses: List[EgoStatus] = []
+                future_cameras: List[Cameras] = []
+                for i in range(num_fut_available):
+                    frame = self.frames[num_hist + i]
+                    future_ego_statuses.append(
+                        EgoStatus(
+                            ego_pose=np.array(future_local_poses[i], dtype=np.float32),
+                            ego_velocity=frame.ego_status.ego_velocity,
+                            ego_acceleration=frame.ego_status.ego_acceleration,
+                            driving_command=frame.ego_status.driving_command,
+                        )
+                    )
+                    future_cameras.append(frame.cameras)
+
+                agent_input.future_ego_statuses = future_ego_statuses
+                agent_input.future_cameras = future_cameras
+
         return agent_input
 
     @classmethod

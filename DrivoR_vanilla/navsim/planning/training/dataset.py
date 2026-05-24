@@ -70,6 +70,44 @@ def builder_uses_latent_image_next(builder: AbstractFeatureBuilder) -> bool:
     return latent_cfg is not None and latent_cfg.get("enabled", False)
 
 
+def builder_uses_temporal_caching(builder: AbstractFeatureBuilder) -> bool:
+    if builder.get_unique_name() != "drivor_feature":
+        return False
+    config = getattr(builder, "_config", None)
+    if config is None:
+        return False
+    tc = config.get("temporal_caching", None) if hasattr(config, "get") else getattr(config, "temporal_caching", None)
+    if tc is None:
+        return False
+    enabled = tc.get("enabled", False) if hasattr(tc, "get") else getattr(tc, "enabled", False)
+    return bool(enabled)
+
+
+def normalize_drivor_temporal(data_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Ensure temporally-cached DrivoR features are shape-consistent for collation.
+
+    If image_history / image_future are missing or shape-inconsistent (e.g. cache built
+    with a different image_size), they get replaced with zeros and the corresponding
+    *_valid mask is zeroed out. No-op when temporal keys are absent.
+    """
+    image = data_dict.get("image")
+    if not isinstance(image, torch.Tensor):
+        return data_dict
+    n_cam, c, h, w = image.shape
+
+    for key, valid_key in (("image_history", "history_valid"), ("image_future", "future_valid")):
+        if key not in data_dict:
+            continue
+        tensor = data_dict[key]
+        if not isinstance(tensor, torch.Tensor) or tensor.dim() != 5 or tensor.shape[1:] != (n_cam, c, h, w):
+            # If the trailing shape mismatches, fall back to zeros sized like image
+            t = tensor.shape[0] if isinstance(tensor, torch.Tensor) else 0
+            t = max(t, 1)
+            data_dict[key] = torch.zeros((t, n_cam, c, h, w), dtype=torch.float32)
+            data_dict[valid_key] = torch.zeros(t, dtype=torch.bool)
+    return data_dict
+
+
 class CacheOnlyDataset(torch.utils.data.Dataset):
     """Dataset wrapper for feature/target datasets from cache only."""
 
@@ -177,6 +215,8 @@ class CacheOnlyDataset(torch.utils.data.Dataset):
             data_dict = load_feature_target_from_pickle(data_dict_path)
             if builder_uses_latent_image_next(builder):
                 data_dict = normalize_drivor_image_next(data_dict)
+            if builder_uses_temporal_caching(builder):
+                data_dict = normalize_drivor_temporal(data_dict)
             features.update(data_dict)
 
         targets: Dict[str, torch.Tensor] = {}
@@ -249,7 +289,8 @@ class Dataset(torch.utils.data.Dataset):
         """
 
         scene = self._scene_loader.get_scene_from_token(token)
-        agent_input = scene.get_agent_input()
+        expose_future = any(builder_uses_temporal_caching(b) for b in self._feature_builders)
+        agent_input = scene.get_agent_input(expose_future=expose_future)
 
         metadata = scene.scene_metadata
         token_path = self._cache_path / metadata.log_name / metadata.initial_token
@@ -262,6 +303,8 @@ class Dataset(torch.utils.data.Dataset):
             if builder_uses_latent_image_next(builder):
                 data_dict = normalize_drivor_image_next(data_dict)
                 invalid_image_next = has_invalid_drivor_image_next(data_dict)
+            if builder_uses_temporal_caching(builder):
+                data_dict = normalize_drivor_temporal(data_dict)
             dump_feature_target_to_pickle(data_dict_path, data_dict)
 
         for builder in self._target_builders:
@@ -289,6 +332,8 @@ class Dataset(torch.utils.data.Dataset):
             data_dict = load_feature_target_from_pickle(data_dict_path)
             if builder_uses_latent_image_next(builder):
                 data_dict = normalize_drivor_image_next(data_dict)
+            if builder_uses_temporal_caching(builder):
+                data_dict = normalize_drivor_temporal(data_dict)
             features.update(data_dict)
 
         targets: Dict[str, torch.Tensor] = {}
@@ -355,7 +400,8 @@ class Dataset(torch.utils.data.Dataset):
             features, targets = self._load_scene_with_token(token)
         else:
             scene = self._scene_loader.get_scene_from_token(self._scene_loader.tokens[idx])
-            agent_input = self._scene_loader.get_agent_input_from_token(self._scene_loader.tokens[idx])
+            expose_future = any(builder_uses_temporal_caching(b) for b in self._feature_builders)
+            agent_input = scene.get_agent_input(expose_future=expose_future)
             for builder in self._feature_builders:
                 features.update(builder.compute_features(agent_input))
             for builder in self._target_builders:

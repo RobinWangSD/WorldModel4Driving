@@ -37,6 +37,24 @@ class DrivoRFeatureBuilder(AbstractFeatureBuilder):
         """Inherited, see superclass."""
         return "drivor_feature"
 
+    def _temporal_caching_active(self) -> bool:
+        tc = getattr(self._config, "temporal_caching", None)
+        if tc is None:
+            return False
+        return bool(getattr(tc, "enabled", False) if not hasattr(tc, "get") else tc.get("enabled", False))
+
+    def _stack_ego(self, ego_statuses):
+        feats = []
+        for ego_status in ego_statuses:
+            if ego_status is None:
+                continue
+            pose = torch.tensor(ego_status.ego_pose, dtype=torch.float32)
+            velocity = torch.tensor(ego_status.ego_velocity, dtype=torch.float32)
+            acceleration = torch.tensor(ego_status.ego_acceleration, dtype=torch.float32)
+            driving_command = torch.tensor(ego_status.driving_command, dtype=torch.float32)
+            feats.append(torch.cat([pose, velocity, acceleration, driving_command], dim=-1))
+        return torch.stack(feats) if feats else torch.zeros((0, 11), dtype=torch.float32)
+
     def compute_features(self, agent_input: AgentInput) -> Dict[str, torch.Tensor]:
         """Inherited, see superclass."""
 
@@ -49,20 +67,34 @@ class DrivoRFeatureBuilder(AbstractFeatureBuilder):
             data_lidar = self._get_lidar_feature(agent_input)
             features.update(data_lidar)
 
-        ego_feature_list=[]
+        features["ego_status"] = self._stack_ego(agent_input.ego_statuses)
 
-        for ego_status in agent_input.ego_statuses:
-            if ego_status is None:
-                continue
-            pose=torch.tensor(ego_status.ego_pose, dtype=torch.float32)
-            velocity = torch.tensor(ego_status.ego_velocity, dtype=torch.float32)
-            acceleration = torch.tensor(ego_status.ego_acceleration, dtype=torch.float32)
-            driving_command = torch.tensor(ego_status.driving_command, dtype=torch.float32)
-            ego_feature=torch.cat([pose,velocity, acceleration, driving_command], dim=-1)
+        if self._temporal_caching_active():
+            # Multi-step temporal tensors. Legacy `ego_status` is preserved above
+            # for back-compat; we add explicit history/future keys here.
+            features["ego_status_history"] = features["ego_status"]
 
-            ego_feature_list.append(ego_feature)
+            future_egos = agent_input.future_ego_statuses or []
+            future_iters = list(self._config.temporal_caching.future_iters)
+            T_fut = len(future_iters)
 
-        features["ego_status"] =torch.stack(ego_feature_list)
+            if future_egos:
+                ego_future = self._stack_ego(future_egos)
+                ego_future_valid = torch.ones(ego_future.shape[0], dtype=torch.bool)
+                # Pad to T_fut if the log boundary truncated future frames
+                if ego_future.shape[0] < T_fut:
+                    pad = torch.zeros((T_fut - ego_future.shape[0], 11), dtype=torch.float32)
+                    ego_future = torch.cat([ego_future, pad], dim=0)
+                    ego_future_valid = torch.cat(
+                        [ego_future_valid, torch.zeros(T_fut - ego_future_valid.shape[0], dtype=torch.bool)],
+                        dim=0,
+                    )
+            else:
+                ego_future = torch.zeros((T_fut, 11), dtype=torch.float32)
+                ego_future_valid = torch.zeros(T_fut, dtype=torch.bool)
+
+            features["ego_status_future"] = ego_future
+            features["ego_future_valid"] = ego_future_valid
 
         return features
 
@@ -88,6 +120,48 @@ class DrivoRFeatureBuilder(AbstractFeatureBuilder):
         std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
         im = (im - mean) / std
         return torch.from_numpy(im).permute(2, 0, 1)
+
+    def _build_per_frame_camera_tensors(self, cameras_obj):
+        """
+        Build (images, cam_Ks, lidar2cams) tensors from one Cameras instance,
+        only including cameras enabled in this builder's config.
+        Returns (image_stack, cam_K_stack, world_2_cam_stack, valid_bool).
+        valid_bool is False iff any active camera lacks an image (placeholder used).
+        """
+        cams = self._active_cameras(cameras_obj)
+        images, cam_Ks, lidar2cams = [], [], []
+        for cam in cams:
+            if cam.image is None:
+                continue
+            im_pil = Image.fromarray(cam.image)
+            cam_K = np.array(cam.intrinsics)
+            sensor2lidar_rotation = np.asarray(cam.sensor2lidar_rotation)
+            sensor2lidar_translation = np.asarray(cam.sensor2lidar_translation)
+            sensor2lidar_rt = np.eye(4)
+            sensor2lidar_rt[:3, :3] = sensor2lidar_rotation
+            sensor2lidar_rt[:3, 3] = sensor2lidar_translation
+            lidar2cam_rt = np.linalg.inv(sensor2lidar_rt)
+
+            original_size = im_pil.size
+            cam_K = cam_K.clone() if isinstance(cam_K, torch.Tensor) else cam_K.copy()
+            cam_K[0, 0] = cam_K[0, 0] * self._config.image_size[0] / original_size[0]
+            cam_K[1, 1] = cam_K[1, 1] * self._config.image_size[1] / original_size[1]
+            cam_K[0, 2] = cam_K[0, 2] * self._config.image_size[0] / original_size[0]
+            cam_K[1, 2] = cam_K[1, 2] * self._config.image_size[1] / original_size[1]
+
+            images.append(self._preprocess_camera_image(cam.image))
+            cam_Ks.append(torch.from_numpy(cam_K))
+            lidar2cams.append(torch.from_numpy(lidar2cam_rt))
+
+        valid = len(images) == len(cams) and len(cams) > 0
+        if images:
+            return (
+                torch.stack(images),
+                torch.stack(cam_Ks),
+                torch.stack(lidar2cams),
+                valid,
+            )
+        return None, None, None, False
 
     def _get_camera_feature(self, agent_input: AgentInput) -> torch.Tensor:
         """
@@ -138,6 +212,51 @@ class DrivoRFeatureBuilder(AbstractFeatureBuilder):
             "cam_K": torch.stack(cam_Ks),
             "world_2_cam": torch.stack(lidar2cams)
         }
+
+        # Multi-step temporal tensors: history + future per-frame stacks.
+        if self._temporal_caching_active():
+            history_iters = list(self._config.temporal_caching.history_iters)
+            future_iters = list(self._config.temporal_caching.future_iters)
+            T_hist = len(history_iters)
+            T_fut = len(future_iters)
+
+            ref_image_shape = data["image"].shape  # (N_cam, 3, H, W)
+
+            # history: iterate agent_input.cameras (length num_history_frames)
+            history_imgs, history_valid_list = [], []
+            for cameras_obj in agent_input.cameras[:T_hist]:
+                stacked, _, _, valid = self._build_per_frame_camera_tensors(cameras_obj)
+                if stacked is None or stacked.shape != ref_image_shape:
+                    stacked = torch.zeros(ref_image_shape, dtype=torch.float32)
+                    valid = False
+                history_imgs.append(stacked)
+                history_valid_list.append(valid)
+
+            # pad to T_hist
+            while len(history_imgs) < T_hist:
+                history_imgs.append(torch.zeros(ref_image_shape, dtype=torch.float32))
+                history_valid_list.append(False)
+
+            data["image_history"] = torch.stack(history_imgs)  # (T_hist, N_cam, 3, H, W)
+            data["history_valid"] = torch.tensor(history_valid_list, dtype=torch.bool)
+
+            # future: iterate agent_input.future_cameras
+            future_imgs, future_valid_list = [], []
+            future_cams = agent_input.future_cameras or []
+            for cameras_obj in future_cams[:T_fut]:
+                stacked, _, _, valid = self._build_per_frame_camera_tensors(cameras_obj)
+                if stacked is None or stacked.shape != ref_image_shape:
+                    stacked = torch.zeros(ref_image_shape, dtype=torch.float32)
+                    valid = False
+                future_imgs.append(stacked)
+                future_valid_list.append(valid)
+
+            while len(future_imgs) < T_fut:
+                future_imgs.append(torch.zeros(ref_image_shape, dtype=torch.float32))
+                future_valid_list.append(False)
+
+            data["image_future"] = torch.stack(future_imgs)  # (T_fut, N_cam, 3, H, W)
+            data["future_valid"] = torch.tensor(future_valid_list, dtype=torch.bool)
 
         latent_cfg = getattr(self._config, "latent_learning", None)
         if latent_cfg is not None and latent_cfg.get("enabled", False):

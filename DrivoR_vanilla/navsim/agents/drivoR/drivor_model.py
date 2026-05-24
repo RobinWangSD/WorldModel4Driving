@@ -2,16 +2,27 @@ from typing import Dict
 import numpy as np
 import torch
 import torch.nn as nn
+from einops import rearrange
 from .score_module.scorer import Scorer
 from .transformer_decoder import TransformerDecoder, TransformerDecoderScorer
 from .layers.image_encoder.dinov2_lora import ImgEncoder
 from .layers.utils.mlp import MLP
-from .layers.latent_predictor import LatentPredictor
-from .layers.losses.latent_loss import LatentLoss
+from .layers.latent_predictor import LatentPredictor, WorldModelLatentPredictor
+from .layers.losses.latent_loss import LatentLoss, MultiStepLatentLoss
 from navsim.agents.drivoR.utils import pylogger
 log = pylogger.get_pylogger(__name__)
 import logging
 # log.setLevel(logging.DEBUG)
+
+_ALL_CAM_KEYS = ("cam_f0", "cam_l0", "cam_l1", "cam_l2", "cam_r0", "cam_r1", "cam_r2", "cam_b0")
+
+
+def _temporal_caching_enabled(config) -> bool:
+    tc = config.get("temporal_caching", None) if hasattr(config, "get") else getattr(config, "temporal_caching", None)
+    if tc is None:
+        return False
+    return bool(tc.get("enabled", False) if hasattr(tc, "get") else getattr(tc, "enabled", False))
+
 
 class DrivoRModel(nn.Module):
     def __init__(self, config):
@@ -31,31 +42,55 @@ class DrivoRModel(nn.Module):
                     "and is not implemented yet."
                 )
 
+        # Temporal caching / multi-mode training
+        self.temporal_caching_enabled = _temporal_caching_enabled(config)
+        self.input_mode = config.get("input_mode", "current_image") if hasattr(config, "get") else getattr(config, "input_mode", "current_image")
+        self.predict_future_latent = bool(config.get("predict_future_latent", False)) if hasattr(config, "get") else bool(getattr(config, "predict_future_latent", False))
+        self.latent_pred_steps = int(config.get("latent_pred_steps", 10)) if hasattr(config, "get") else int(getattr(config, "latent_pred_steps", 10))
+
+        if self.temporal_caching_enabled:
+            tc = config["temporal_caching"]
+            self.t_hist = len(tc["history_iters"])
+            self.t_fut = len(tc["future_iters"])
+            assert 1 <= self.latent_pred_steps <= self.t_fut, (
+                f"latent_pred_steps={self.latent_pred_steps} must be in [1, {self.t_fut}]"
+            )
+        else:
+            self.t_hist = 1
+            self.t_fut = 0
+
+        assert self.input_mode in ("current_image", "history_images"), (
+            f"Unknown input_mode={self.input_mode!r}; must be 'current_image' or 'history_images'"
+        )
+        if self.input_mode == "history_images" and not self.temporal_caching_enabled:
+            raise ValueError("input_mode='history_images' requires temporal_caching.enabled=true")
+        if self.predict_future_latent and not self.temporal_caching_enabled:
+            raise ValueError("predict_future_latent=true requires temporal_caching.enabled=true")
+
         ###########################################
         # camera embedding
-        self.num_cams = 0
-        if len(self._config["cam_f0"]) > 0:
-            self.num_cams += 1
-        if len(self._config["cam_l0"]) > 0:
-            self.num_cams += 1
-        if len(self._config["cam_l1"]) > 0:
-            self.num_cams += 1
-        if len(self._config["cam_l2"]) > 0:
-            self.num_cams += 1
-        if len(self._config["cam_r0"]) > 0:
-            self.num_cams += 1
-        if len(self._config["cam_r1"]) > 0:
-            self.num_cams += 1
-        if len(self._config["cam_r2"]) > 0:
-            self.num_cams += 1
-        if len(self._config["cam_b0"]) > 0:
-            self.num_cams += 1
+        if self.temporal_caching_enabled:
+            active = set(config["temporal_caching"]["active_cameras"])
+            self.num_cams = sum(1 for k in _ALL_CAM_KEYS if k in active)
+        else:
+            self.num_cams = 0
+            for k in _ALL_CAM_KEYS:
+                if len(self._config[k]) > 0:
+                    self.num_cams += 1
 
         ############################################
         # lidar embedding
         self.num_lidar = 0
         if len(self._config["lidar_pc"]) > 0:
             self.num_lidar += 1
+
+        # Effective number of "views" the image backbone sees per sample.
+        # In history_images mode we fold T_hist into the camera dimension so the
+        # backbone treats each (t, cam) as an independent view.
+        if self.input_mode == "history_images":
+            self.effective_num_cams = self.num_cams * self.t_hist
+        else:
+            self.effective_num_cams = self.num_cams
 
         # create the image backbone
         if self.num_cams > 0:
@@ -64,9 +99,18 @@ class DrivoRModel(nn.Module):
             config_image_backbone["num_scene_tokens"] = config["num_scene_tokens"]
             config_image_backbone["tf_d_model"] = config["tf_d_model"]
             self.image_backbone = ImgEncoder(config_image_backbone)
-            self.scene_embeds = nn.Parameter(torch.randn(1, self.num_cams, self._config.num_scene_tokens, self.image_backbone.num_features)*1e-6, requires_grad=True)
+            self.scene_embeds = nn.Parameter(
+                torch.randn(1, self.effective_num_cams, self._config.num_scene_tokens, self.image_backbone.num_features) * 1e-6,
+                requires_grad=True,
+            )
 
-            # print("self.scene_embeds ", self.scene_embeds)
+            # Temporal positional embedding for history_images: one vector per
+            # history step, broadcast over cameras and scene tokens.
+            if self.input_mode == "history_images":
+                self.temporal_pe = nn.Parameter(
+                    torch.zeros(1, self.t_hist, 1, 1, self.image_backbone.num_features),
+                    requires_grad=True,
+                )
 
         # create the lidar backbone
         if self.num_lidar > 0:
@@ -134,6 +178,34 @@ class DrivoRModel(nn.Module):
                 sigreg_num_proj=latent_cfg.get("sigreg_num_proj", 1024),
             )
 
+        # World-model multi-step latent prediction (Mode 3).
+        # Independent of the legacy one-step `latent_learning` path above —
+        # this one runs when `predict_future_latent=true` and uses cached
+        # `image_future` as targets and `ego_status_future` as teacher-forced
+        # action conditioning.
+        if self.predict_future_latent:
+            if self.num_cams == 0:
+                raise ValueError("predict_future_latent=true requires at least one active camera")
+            # Reuse latent_learning predictor sub-config if available so the user
+            # can tune nhead/num_layers/d_ffn through the existing config block.
+            pred_cfg = latent_cfg.get("predictor", {}) if latent_cfg is not None else {}
+            stop_grad = latent_cfg.get("stop_grad_target", True) if latent_cfg is not None else True
+            n_tokens_per_view = config.num_scene_tokens
+            # Predictor output is matched to a single-step target latent shape:
+            # (num_cams * num_scene_tokens) tokens per future step. When input_mode
+            # folds T_hist into the camera dimension, the predictor input is
+            # collapsed back over time by mean-pooling in _compute_world_model_loss.
+            self.world_model_predictor = WorldModelLatentPredictor(
+                d_model=config.tf_d_model,
+                nhead=pred_cfg.get("nhead", 4),
+                num_layers=pred_cfg.get("num_layers", 2),
+                d_ffn=pred_cfg.get("d_ffn", 512),
+                ego_dim=11,
+                n_pred_steps=self.latent_pred_steps,
+                n_tokens=self.num_cams * n_tokens_per_view,
+            )
+            self.world_model_loss_fn = MultiStepLatentLoss(stop_grad_target=stop_grad)
+
 
     def forward(self, features: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         
@@ -156,20 +228,33 @@ class DrivoRModel(nn.Module):
         scene_features = []
         next_tokens = None
         latent_valid_mask = None
-        want_latent = self.use_latent and self.training and self.one_step and self.num_cams > 0
+        want_world_model = (
+            self.predict_future_latent
+            and self.training
+            and self.num_cams > 0
+            and "image_future" in features
+            and "ego_status_future" in features
+        )
+        # The world-model head supersedes the legacy one-step latent path: both
+        # consume cached "next image" data and emit a `latent_loss_dict`, so
+        # enabling both at once would double-count the latent loss.
+        want_latent = (
+            self.use_latent
+            and self.training
+            and self.one_step
+            and self.num_cams > 0
+            and not want_world_model
+        )
         # image features
         if self.num_cams > 0:
-            if "image" in features:
-                img = features["image"]
-            elif "camera_feature" in features:
-                img = features["camera_feature"]
-            else:
-                raise ValueError
+            img = self._select_input_image(features)  # (B, effective_num_cams, C, H, W)
 
             if want_latent:
+                # legacy one-step latent path: needs same-shape img_next as img
                 img_next, latent_valid_mask = self._get_valid_image_next(features, img)
 
             scene_tokens = self.scene_embeds.repeat(batch_size, 1, 1, 1)
+            scene_tokens = self._apply_temporal_pe(scene_tokens)
             image_scene_tokens = self.image_backbone(img, scene_tokens)
 
             if want_latent:
@@ -203,6 +288,10 @@ class DrivoRModel(nn.Module):
                 next_tokens,
                 latent_valid_mask,
             )
+
+        # World-model multi-step latent prediction (Mode 3).
+        if want_world_model:
+            latent_loss_dict = self._compute_world_model_loss(features, image_scene_tokens)
 
         # initial trajectories
         proposals = self.traj_head[0](traj_tokens).reshape(traj_tokens.shape[0], -1, self.poses_num, self.state_size)
@@ -293,3 +382,93 @@ class DrivoRModel(nn.Module):
         ego_t = ego_status[:, -1] if ego_status.dim() == 3 else ego_status
         predicted = self.latent_predictor(cur_tokens, ego_t)
         return self.latent_loss_fn(predicted.unsqueeze(1), next_tokens.unsqueeze(1), valid_mask=valid_mask)
+
+    def _select_input_image(self, features):
+        """Return (B, effective_num_cams, C, H, W) image tensor based on input_mode.
+
+        - current_image: last history step or legacy `image` key
+        - history_images: full image_history tensor, T_hist folded into the camera dim
+        """
+        if self.input_mode == "history_images":
+            assert "image_history" in features, "input_mode=history_images requires features['image_history']"
+            img_hist = features["image_history"]  # (B, T_hist, N_cam, C, H, W)
+            T, N = img_hist.shape[1], img_hist.shape[2]
+            assert T == self.t_hist, f"image_history T={T} but model expects {self.t_hist}"
+            assert N == self.num_cams, f"image_history N={N} but model expects {self.num_cams}"
+            return rearrange(img_hist, "b t n c h w -> b (t n) c h w")
+
+        # current_image
+        if "image_history" in features:
+            img = features["image_history"][:, -1]  # (B, N_cam, C, H, W)
+        elif "image" in features:
+            img = features["image"]
+        elif "camera_feature" in features:
+            img = features["camera_feature"]
+        else:
+            raise ValueError("No image tensor found in features")
+        return img
+
+    def _apply_temporal_pe(self, scene_tokens):
+        """Add a per-history-step bias to scene_tokens shaped (B, T_hist*N_cam, num_scene_tokens, D)."""
+        if self.input_mode != "history_images":
+            return scene_tokens
+        B, TN, S, D = scene_tokens.shape
+        pe = self.temporal_pe.expand(B, self.t_hist, self.num_cams, S, D).reshape(B, TN, S, D)
+        return scene_tokens + pe
+
+    def _compute_world_model_loss(self, features, image_scene_tokens):
+        """Multi-step latent prediction loss using cached image_future and ego_status_future.
+
+        Predictor I/O: (B, num_cams*S, D) -> (B, T_pred, num_cams*S, D).
+        Target: backbone applied to each future step independently (single time step
+        worth of cameras), shape (B, T_pred, num_cams*S, D).
+        """
+        image_future = features["image_future"]  # (B, T_fut, N_cam, C, H, W)
+        ego_future = features["ego_status_future"]  # (B, T_fut, 11)
+        future_valid = features.get("future_valid", None)  # (B, T_fut) bool
+
+        if image_scene_tokens.dim() != 3:
+            raise RuntimeError(
+                f"image_scene_tokens expected (B, T, D); got shape {tuple(image_scene_tokens.shape)}"
+            )
+        D = image_scene_tokens.shape[-1]
+        N_cam = self.num_cams
+        S = self._config.num_scene_tokens
+
+        T_pred = self.latent_pred_steps
+        B = image_future.shape[0]
+        img_f = image_future[:, :T_pred]  # (B, T_pred, N_cam, C, H, W)
+        ego_f = ego_future[:, :T_pred]
+        T_pred_, C, H, W = img_f.shape[1], img_f.shape[3], img_f.shape[4], img_f.shape[5]
+        img_f_flat = img_f.reshape(B * T_pred_, N_cam, C, H, W)
+
+        # Build a per-view scene-embed (collapse the time dim if input_mode folded it in).
+        if self.input_mode == "history_images":
+            per_view_embeds = self.scene_embeds.view(1, self.t_hist, N_cam, S, D).mean(dim=1)
+        else:
+            per_view_embeds = self.scene_embeds  # (1, N_cam, S, D)
+        target_embeds = per_view_embeds.expand(B * T_pred_, -1, -1, -1).contiguous()
+
+        if self.world_model_loss_fn.stop_grad_target:
+            with torch.no_grad():
+                target_tokens = self.image_backbone(img_f_flat, target_embeds)
+        else:
+            target_tokens = self.image_backbone(img_f_flat, target_embeds)
+        # target_tokens: (B*T_pred, N_cam*S, D) -> (B, T_pred, N_cam*S, D)
+        target_tokens = target_tokens.view(B, T_pred_, N_cam * S, D)
+
+        # Collapse the time-folded input down to per-view token count for the predictor.
+        if self.input_mode == "history_images":
+            cur_tokens = image_scene_tokens.view(B, self.t_hist, N_cam * S, D).mean(dim=1)
+        else:
+            cur_tokens = image_scene_tokens
+
+        # Predict
+        ego_hist = features.get("ego_status_history", features["ego_status"])  # (B, T_hist, 11)
+        predicted = self.world_model_predictor(cur_tokens, ego_hist, ego_f)  # (B, T_pred, N_cam*S, D)
+
+        return self.world_model_loss_fn(
+            predicted,
+            target_tokens,
+            valid_mask=(future_valid[:, :T_pred] if future_valid is not None else None),
+        )

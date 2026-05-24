@@ -153,19 +153,41 @@ class DrivoRAgent(AbstractAgent):
                     "state_dict"]
             self.load_state_dict({k.replace("agent._drivor_model", "_drivor_model"): v for k, v in state_dict.items()})
 
+    def _temporal_caching_active(self) -> bool:
+        tc = self._config.get("temporal_caching", None) if hasattr(self._config, "get") else getattr(self._config, "temporal_caching", None)
+        if tc is None:
+            return False
+        enabled = tc.get("enabled", False) if hasattr(tc, "get") else getattr(tc, "enabled", False)
+        return bool(enabled)
+
+    @property
+    def requires_future_cameras(self) -> bool:
+        return self._temporal_caching_active()
+
     def get_sensor_config(self) :
         """Inherited, see superclass."""
-        # return SensorConfig(
-        #     cam_f0=[3],
-        #     cam_l0=[3],
-        #     cam_l1=[],
-        #     cam_l2=[],
-        #     cam_r0=[3],
-        #     cam_r1=[],
-        #     cam_r2=[],
-        #     cam_b0=[3],
-        #     lidar_pc=[],
-        # )
+        if self._temporal_caching_active():
+            tc = self._config["temporal_caching"]
+            history_iters = list(OmegaConf.to_object(tc["history_iters"]))
+            future_iters = list(OmegaConf.to_object(tc["future_iters"]))
+            active_cameras = set(OmegaConf.to_object(tc["active_cameras"]))
+            combined = sorted(set(history_iters) | set(future_iters))
+
+            def _list_for(cam: str) -> List[int]:
+                return combined if cam in active_cameras else []
+
+            return SensorConfig(
+                cam_f0=_list_for("cam_f0"),
+                cam_l0=_list_for("cam_l0"),
+                cam_l1=_list_for("cam_l1"),
+                cam_l2=_list_for("cam_l2"),
+                cam_r0=_list_for("cam_r0"),
+                cam_r1=_list_for("cam_r1"),
+                cam_r2=_list_for("cam_r2"),
+                cam_b0=_list_for("cam_b0"),
+                lidar_pc=OmegaConf.to_object(self._config["lidar_pc"]),
+            )
+
         return SensorConfig(
             cam_f0=OmegaConf.to_object(self._config["cam_f0"]),
             cam_l0=OmegaConf.to_object(self._config["cam_l0"]),
@@ -177,7 +199,7 @@ class DrivoRAgent(AbstractAgent):
             cam_b0=OmegaConf.to_object(self._config["cam_b0"]),
             lidar_pc=OmegaConf.to_object(self._config["lidar_pc"]),
         )
-    
+
     def get_target_builders(self) :
         return [DrivoRTargetBuilder(config=self._config)]
 
@@ -292,7 +314,14 @@ class DrivoRAgent(AbstractAgent):
                                         dirpath="/dev/shm/ckpts"  # tmpfs (RAM); wandb uploads to cloud
                                         )
 
-        checkpoint_cb = ModelCheckpoint(save_last=True, dirpath="/dev/shm/ckpts")
+        checkpoint_cb = ModelCheckpoint(
+            save_top_k=-1,
+            every_n_epochs=1,
+            save_last=True,
+            filename='epoch-{epoch:02d}-step-{step}',
+            auto_insert_metric_name=False,
+            dirpath="/dev/shm/ckpts",
+        )
 
         lr_monitor = LearningRateMonitor(logging_interval="step",
                                             log_momentum=False,

@@ -86,3 +86,52 @@ class LatentLoss(nn.Module):
         b, t, n, d = tokens.shape
         proj = tokens.permute(1, 0, 2, 3).reshape(t, b * n, d)
         return self.sigreg(proj)
+
+
+class MultiStepLatentLoss(nn.Module):
+    """Multi-step latent prediction loss.
+
+    Computes MSE between predicted and target scene-token latents over T_pred
+    future steps, masked per (batch, step) by an optional validity tensor.
+    """
+
+    def __init__(self, stop_grad_target: bool = True):
+        super().__init__()
+        self.stop_grad_target = stop_grad_target
+
+    def forward(
+        self,
+        predicted_tokens: torch.Tensor,
+        target_tokens: torch.Tensor,
+        valid_mask: torch.Tensor = None,
+    ) -> dict:
+        """
+        Args:
+            predicted_tokens: (B, T_pred, N, D)
+            target_tokens:    (B, T_pred, N, D)
+            valid_mask:       optional (B, T_pred) bool. Invalid (b, t) entries
+                              keep the graph connected but contribute zero loss.
+        Returns:
+            dict with keys {loss, latent_prediction}.
+        """
+        if predicted_tokens.shape != target_tokens.shape:
+            raise ValueError(
+                f"predicted vs target shape mismatch: {predicted_tokens.shape} vs {target_tokens.shape}"
+            )
+        if predicted_tokens.ndim != 4:
+            raise ValueError(f"Expected (B, T, N, D); got {tuple(predicted_tokens.shape)}")
+
+        target = target_tokens.detach() if self.stop_grad_target else target_tokens
+        per_step_loss = (predicted_tokens - target).pow(2).flatten(2).mean(dim=2)  # (B, T_pred)
+
+        if valid_mask is None:
+            loss = per_step_loss.mean()
+        else:
+            valid = valid_mask.to(device=per_step_loss.device, dtype=per_step_loss.dtype)
+            if valid.shape != per_step_loss.shape:
+                # graceful degrade: if shapes mismatch, treat all as valid
+                loss = per_step_loss.mean()
+            else:
+                loss = (per_step_loss * valid).sum() / valid.sum().clamp_min(1.0)
+
+        return {"loss": loss, "latent_prediction": loss}
