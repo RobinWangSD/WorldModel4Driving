@@ -89,7 +89,7 @@ class GridMask(nn.Module):
         if np.random.rand() > self.prob or not self.training:
             return x
         n, c, h, w = x.size()
-        x = x.view(-1, h, w)
+        x = x.reshape(-1, h, w)
         hh = int(1.5 * h)
         ww = int(1.5 * w)
         d = np.random.randint(2, h)
@@ -124,4 +124,4 @@ class GridMask(nn.Module):
         else:
             x = x * mask
 
-        return x.view(n, c, h, w)
+        return x.reshape(n, c, h, w)
